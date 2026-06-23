@@ -14,7 +14,6 @@ CONFIG = {
     'CLEANED_DATA_PATH': 'data/cleaned/taxi_cleaned.csv',
     'LOG_PATH': 'logs/clean_od_startup.log',
     'BASE_DATE': '2023-10-12',
-    'CHUNK_SIZE': 5000000,
     'TIME_THRESHOLD_SEC': 60,
     'COLUMN_NAMES': ['id', 'time', 'long', 'lati', 'status', 'speed'],
     'PICKUP_OUTPUT_PATH': 'data/processed/pickup_points.csv',
@@ -123,8 +122,8 @@ def identify_anomalies(df, time_threshold_sec):
     return cleaned_df, len(anomalies)
 
 
-def clean_chunk(df, base_date, time_threshold_sec):
-    """清洗单个数据块"""
+def clean_data(df, base_date, time_threshold_sec):
+    """整体清洗数据"""
     df_clean = df.copy()
     
     df_clean['time'] = pd.to_datetime(
@@ -140,65 +139,6 @@ def clean_chunk(df, base_date, time_threshold_sec):
     df_clean, anomaly_removed = identify_anomalies(df_clean, time_threshold_sec)
     
     return df_clean, dup_removed, anomaly_removed
-
-
-def process_with_boundary(chunk_iter, base_date, time_threshold_sec):
-    """带边界处理的分块清洗流程"""
-    total_original = 0
-    total_cleaned = 0
-    total_dup_removed = 0
-    total_anomaly_removed = 0
-    prev_chunk_last_row = None
-    first_chunk = True
-    
-    if os.path.exists(CONFIG['CLEANED_DATA_PATH']):
-        os.remove(CONFIG['CLEANED_DATA_PATH'])
-    
-    for chunk_idx, chunk in enumerate(chunk_iter):
-        chunk.columns = CONFIG['COLUMN_NAMES']
-        original_len = len(chunk)
-        total_original += original_len
-        
-        if prev_chunk_last_row is not None:
-            chunk = pd.concat([prev_chunk_last_row, chunk], ignore_index=True)
-        
-        logging.info(f"处理分块 {chunk_idx + 1}，原始行数: {len(chunk)}")
-        
-        cleaned_chunk, dup_removed, anomaly_removed = clean_chunk(chunk, base_date, time_threshold_sec)
-        
-        if len(cleaned_chunk) > 0:
-            prev_chunk_last_row = cleaned_chunk.iloc[[-1]].copy()
-            cleaned_chunk = cleaned_chunk.iloc[:-1]
-        
-        cleaned_chunk.to_csv(
-            CONFIG['CLEANED_DATA_PATH'],
-            mode='a',
-            header=first_chunk,
-            index=False,
-            encoding='utf-8'
-        )
-        first_chunk = False
-        
-        total_cleaned += len(cleaned_chunk)
-        total_dup_removed += dup_removed
-        total_anomaly_removed += anomaly_removed
-        
-        logging.info(f"  分块 {chunk_idx + 1} 清洗完成")
-        logging.info(f"    - 清洗后行数: {len(cleaned_chunk)}")
-        logging.info(f"    - 剔除重复数: {dup_removed}")
-        logging.info(f"    - 剔除异常数: {anomaly_removed}")
-    
-    if prev_chunk_last_row is not None:
-        prev_chunk_last_row.to_csv(
-            CONFIG['CLEANED_DATA_PATH'],
-            mode='a',
-            header=False,
-            index=False,
-            encoding='utf-8'
-        )
-        total_cleaned += len(prev_chunk_last_row)
-    
-    return total_original, total_cleaned, total_dup_removed, total_anomaly_removed
 
 
 def extract_od_points(df):
@@ -248,27 +188,31 @@ def main():
         log.error("请将原始CSV数据文件放置在 data/raw/ 目录下")
         sys.exit(1)
     
-    log.info("【开始分块读取与清洗】")
-    chunk_iter = pd.read_csv(
+    log.info("【开始整体读取与清洗】")
+    df = pd.read_csv(
         CONFIG['RAW_DATA_PATH'],
         header=None,
-        chunksize=CONFIG['CHUNK_SIZE'],
         encoding='utf-8'
     )
+    df.columns = CONFIG['COLUMN_NAMES']
     
-    total_original, total_cleaned, total_dup_removed, total_anomaly_removed = process_with_boundary(
-        chunk_iter,
+    total_original = len(df)
+    log.info(f"  原始数据行数: {total_original}")
+    
+    df_final, total_dup_removed, total_anomaly_removed = clean_data(
+        df,
         CONFIG['BASE_DATE'],
         CONFIG['TIME_THRESHOLD_SEC']
     )
+    total_cleaned = len(df_final)
+    
+    log.info(f"  清洗后行数: {total_cleaned}")
+    log.info(f"  剔除重复数: {total_dup_removed}")
+    log.info(f"  剔除异常数: {total_anomaly_removed}")
     log.info("")
     
-    log.info("【加载清洗后数据】")
-    df_final = pd.read_csv(CONFIG['CLEANED_DATA_PATH'], encoding='utf-8')
-    df_final['time'] = pd.to_datetime(df_final['time'])
-    df_final.sort_values(by=['id', 'time'], ascending=[True, True], inplace=True)
-    df_final.reset_index(drop=True, inplace=True)
-    log.info(f"  加载后总行数: {len(df_final)}")
+    df_final.to_csv(CONFIG['CLEANED_DATA_PATH'], index=False, encoding='utf-8')
+    log.info(f"  清洗后数据已保存至: {CONFIG['CLEANED_DATA_PATH']}")
     log.info("")
     
     log.info("【清洗摘要】")
