@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
-VIEW_OPTIONS = ["轨迹查询", "分钟位置", "OD点标注", "动画轨迹"]
+VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注"]
 
 
 DEFAULTS = {
@@ -48,7 +48,6 @@ DEFAULTS = {
     "minute_hour": 9,
     "minute_minute": 30,
     "time_scale": 2.0,
-    "display_limit": 1200,
     "ref_lat": float(CONFIG["MAP_CENTER"][0]),
     "ref_lng": float(CONFIG["MAP_CENTER"][1]),
     "active_view": "轨迹查询",
@@ -109,10 +108,15 @@ def init_page():
         [data-testid="stSidebar"] .stTextInput input,
         [data-testid="stSidebar"] .stNumberInput input,
         [data-testid="stSidebar"] .stDateInput input,
-        [data-testid="stSidebar"] .stTimeInput input,
         [data-testid="stSidebar"] .stSelectbox div,
         [data-testid="stSidebar"] .stSlider {
             background: #ffffff !important;
+        }
+
+        [data-testid="stSidebar"] .stNumberInput input {
+            color: var(--text) !important;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
         }
 
         .stTextInput input,
@@ -172,27 +176,11 @@ def init_page():
             overflow-wrap: anywhere;
         }
 
-        .section-panel {
-            background: #ffffff;
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 18px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
-        }
-
         .subtle-panel {
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 14px;
             padding: 14px 16px;
-        }
-
-        .view-selector {
-            background: #ffffff;
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 10px 12px;
-            margin-bottom: 12px;
         }
 
         .stRadio > div {
@@ -316,7 +304,6 @@ def build_query_payload():
         "end_time": end_time,
         "minute_time": minute_time,
         "time_scale": float(st.session_state["time_scale"]),
-        "display_limit": int(st.session_state["display_limit"]),
         "ref_lat": float(st.session_state["ref_lat"]),
         "ref_lng": float(st.session_state["ref_lng"]),
     }
@@ -335,9 +322,6 @@ def validate_payload(payload):
     if payload["time_scale"] <= 0:
         errors.append("动画速度必须大于 0。")
 
-    if payload["display_limit"] <= 0:
-        errors.append("分钟显示数量必须大于 0。")
-
     return errors
 
 
@@ -350,21 +334,28 @@ def sidebar_form():
         st.markdown("#### 轨迹时间")
         c1, c2 = st.columns(2)
         with c1:
-            st.number_input("开始小时", min_value=0, max_value=23, key="start_hour", step=1)
-            st.number_input("开始分钟", min_value=0, max_value=59, key="start_minute", step=1)
+            st.caption("开始时间")
+            t1, t2 = st.columns(2)
+            with t1:
+                st.number_input("时", min_value=0, max_value=23, key="start_hour", step=1, format="%02d", label_visibility="collapsed")
+            with t2:
+                st.number_input("分", min_value=0, max_value=59, key="start_minute", step=1, format="%02d", label_visibility="collapsed")
         with c2:
-            st.number_input("结束小时", min_value=0, max_value=23, key="end_hour", step=1)
-            st.number_input("结束分钟", min_value=0, max_value=59, key="end_minute", step=1)
+            st.caption("结束时间")
+            t3, t4 = st.columns(2)
+            with t3:
+                st.number_input("时", min_value=0, max_value=23, key="end_hour", step=1, format="%02d", label_visibility="collapsed")
+            with t4:
+                st.number_input("分", min_value=0, max_value=59, key="end_minute", step=1, format="%02d", label_visibility="collapsed")
 
         st.markdown("#### 分钟查询时间")
-        c3, c4 = st.columns(2)
-        with c3:
-            st.number_input("分钟小时", min_value=0, max_value=23, key="minute_hour", step=1)
-        with c4:
-            st.number_input("分钟分钟", min_value=0, max_value=59, key="minute_minute", step=1)
+        m1, m2 = st.columns(2)
+        with m1:
+            st.number_input("分钟时", min_value=0, max_value=23, key="minute_hour", step=1, format="%02d", label_visibility="collapsed")
+        with m2:
+            st.number_input("分钟分", min_value=0, max_value=59, key="minute_minute", step=1, format="%02d", label_visibility="collapsed")
 
         st.slider("动画速度", 0.5, 5.0, key="time_scale", step=0.1)
-        st.slider("分钟地图最大车辆数", 100, 20000, key="display_limit", step=100)
 
         st.markdown("#### ETA 预留坐标")
         c3, c4 = st.columns(2)
@@ -454,38 +445,26 @@ def render_summary(payload):
     )
 
 
-def render_html_map(html_path, height=700):
+def render_html_map(html_path, height=700, loading_message="加载中..."):
     if html_path and os.path.exists(html_path):
+        st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
         with open(html_path, "r", encoding="utf-8") as f:
-            st.components.v1.html(f.read(), height=height, scrolling=True)
+            html_content = f.read()
+        st.components.v1.html(html_content, height=height, scrolling=True)
     else:
         st.error("地图生成失败，请检查数据缓存是否存在。")
 
 
-def render_data_preview(df, title, max_rows=20):
-    st.markdown(f"**{title}**")
-    if df is None or len(df) == 0:
-        st.caption("没有可预览的数据。")
-        return
-
-    preview_df = df.head(max_rows).copy()
-    st.dataframe(preview_df, use_container_width=True, height=min(420, 42 + 28 * len(preview_df)))
-    st.caption(f"共 {len(df):,} 条记录，当前仅预览前 {len(preview_df):,} 条。")
-
-
 def render_trajectory_view(payload):
-    st.markdown('<div class="section-panel">', unsafe_allow_html=True)
     st.subheader("轨迹查询")
     if not payload["vehicle_id"]:
         st.info("请输入车辆 ID 后查看单车轨迹。")
-        st.markdown("</div>", unsafe_allow_html=True)
         return
 
     with st.spinner("正在读取车辆缓存并生成轨迹地图..."):
         df = cached_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"])
         if df is None or len(df) == 0:
             st.warning("未找到符合条件的轨迹数据。")
-            st.markdown("</div>", unsafe_allow_html=True)
             return
 
         cols = st.columns(4)
@@ -501,17 +480,14 @@ def render_trajectory_view(payload):
 
         st.caption("轨迹按状态自动着色：红色表示载客，蓝色表示空载。")
         render_html_map(plot_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"]), height=700)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_minute_view(payload):
-    st.markdown('<div class="section-panel">', unsafe_allow_html=True)
     st.subheader("分钟位置查询")
     with st.spinner("正在读取分钟缓存并生成位置地图..."):
         df = cached_minute_data(payload["minute_time"])
         if df is None or len(df) == 0:
             st.warning("该分钟没有车辆数据。")
-            st.markdown("</div>", unsafe_allow_html=True)
             return
 
         df_view = df
@@ -525,7 +501,6 @@ def render_minute_view(payload):
                         f"该车辆缓存轨迹时间范围为 {time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')} "
                         f"至 {time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}，可尝试调整分钟查询时间。"
                     )
-                st.markdown("</div>", unsafe_allow_html=True)
                 return
             df_view = vehicle_df
             st.caption(f"当前仅显示车辆 {payload['vehicle_id']} 的分钟位置。")
@@ -542,20 +517,16 @@ def render_minute_view(payload):
             with col:
                 st.metric(label, value)
 
-        render_data_preview(df_view, "分钟数据预览", max_rows=20)
         render_html_map(
             plot_minute_vehicles(
                 payload["minute_time"],
                 payload["vehicle_id"] if payload["vehicle_id"] else None,
-                display_limit=payload["display_limit"],
             ),
             height=700,
         )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_od_view(payload):
-    st.markdown('<div class="section-panel">', unsafe_allow_html=True)
     st.subheader("OD 上下车点")
     with st.spinner("正在读取 OD 表并生成上下车点地图..."):
         df = cached_od_data(payload["start_time"], payload["end_time"], payload["vehicle_id"] or None)
@@ -570,7 +541,6 @@ def render_od_view(payload):
                     )
             else:
                 st.warning("当前时间范围内未找到 OD 数据。")
-            st.markdown("</div>", unsafe_allow_html=True)
             return
 
         cols = st.columns(4)
@@ -585,32 +555,25 @@ def render_od_view(payload):
                 st.metric(label, value)
 
         st.caption("绿色为上车点，红色为下车点。点较多时会自动聚类并抽样连线。")
-        render_data_preview(df, "OD 数据预览", max_rows=20)
         render_html_map(
             plot_od_points(payload["start_time"], payload["end_time"], payload["vehicle_id"] or None),
             height=700,
         )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_animation_view(payload):
-    st.markdown('<div class="section-panel">', unsafe_allow_html=True)
     st.subheader("单车动画轨迹")
     if not payload["vehicle_id"]:
         st.info("请输入车辆 ID 后播放动画轨迹。")
-        st.markdown("</div>", unsafe_allow_html=True)
         return
 
     with st.spinner("正在生成动画轨迹..."):
         df = cached_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"])
         if df is None or len(df) < 2:
             st.warning("轨迹点不足，无法生成动画。")
-            st.markdown("</div>", unsafe_allow_html=True)
             return
 
-        st.caption(
-            "动画会根据相邻轨迹点的时间差自动调节播放节奏，并在当前位置显示速度与状态。"
-        )
+        st.caption("动画采用逐帧插值播放，并根据相邻轨迹点的时间差模拟速度变化。")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("轨迹点", len(df))
@@ -628,7 +591,6 @@ def render_animation_view(payload):
             ),
             height=780,
         )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_query_status(payload):
@@ -670,7 +632,6 @@ def main():
         render_summary(active_payload)
         render_query_status(active_payload)
 
-        st.markdown('<div class="view-selector">', unsafe_allow_html=True)
         active_view = st.radio(
             "功能切换",
             VIEW_OPTIONS,
@@ -678,16 +639,15 @@ def main():
             key="active_view",
             label_visibility="collapsed",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
 
         if active_view == "轨迹查询":
             render_trajectory_view(active_payload)
+        elif active_view == "动画轨迹":
+            render_animation_view(active_payload)
         elif active_view == "分钟位置":
             render_minute_view(active_payload)
         elif active_view == "OD点标注":
             render_od_view(active_payload)
-        elif active_view == "动画轨迹":
-            render_animation_view(active_payload)
 
         st.markdown("---")
         st.caption("数据来源: cache/vehicles/ | cache/minutes/ | data/processed/od_table.csv")

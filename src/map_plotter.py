@@ -657,14 +657,17 @@ def plot_od_points(start_time, end_time, vehicle_id=None, save_path=None, use_cl
 def _build_animation_html(vehicle_id, df, time_scale):
     features = []
     for idx, row in df.iterrows():
+        speed_value = float(row["speed_kmh"]) if "speed_kmh" in row and pd.notna(row["speed_kmh"]) else float(row.get("speed", 0.0))
+        time_ms = int(pd.Timestamp(row["time"]).timestamp() * 1000)
         features.append(
             {
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [float(row["long"]), float(row["lati"])]},
                 "properties": {
                     "time": row["time"].strftime("%Y-%m-%d %H:%M:%S"),
+                    "timeMs": time_ms,
                     "status": int(row["status"]),
-                    "speed": float(row["speed"]),
+                    "speed": speed_value,
                     "index": int(idx),
                 },
             }
@@ -694,14 +697,15 @@ def _build_animation_html(vehicle_id, df, time_scale):
             --text: #0f172a;
             --muted: #475569;
             --accent: #ef4444;
+            --accent-soft: rgba(239, 68, 68, 0.12);
         }}
-        html, body {{ margin: 0; padding: 0; height: 100%; background: #eef2f7; color: var(--text); }}
+        html, body {{ margin: 0; padding: 0; height: 100%; background: #f5f5f5; color: var(--text); overflow: hidden; }}
         #controls {{
             position: absolute;
             top: 12px;
             left: 12px;
             z-index: 1000;
-            padding: 12px 14px;
+            padding: 12px 14px 10px;
             background: var(--panel-bg);
             border: 1px solid var(--panel-border);
             border-radius: 14px;
@@ -709,9 +713,18 @@ def _build_animation_html(vehicle_id, df, time_scale):
             backdrop-filter: blur(10px);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             font-size: 14px;
-            min-width: 300px;
+            min-width: 320px;
         }}
-        #map {{ width: 100%; height: calc(100vh - 78px); margin-top: 78px; }}
+        #controls .row {{ margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+        #controls select {{
+            border: 1px solid var(--panel-border);
+            border-radius: 10px;
+            padding: 7px 10px;
+            background: #fff;
+            color: var(--text);
+            min-width: 150px;
+        }}
+        #map {{ width: 100%; height: 100vh; }}
         #info {{
             position: absolute;
             left: 12px;
@@ -727,6 +740,15 @@ def _build_animation_html(vehicle_id, df, time_scale):
             display: flex;
             gap: 14px;
             flex-wrap: wrap;
+            align-items: center;
+        }}
+        #speedPanel {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(148, 163, 184, 0.2);
         }}
         .btn {{
             border: 0;
@@ -738,7 +760,7 @@ def _build_animation_html(vehicle_id, df, time_scale):
             cursor: pointer;
         }}
         .btn.secondary {{ background: #475569; }}
-        input[type="range"] {{ width: 190px; vertical-align: middle; }}
+        input[type="range"] {{ width: 190px; vertical-align: middle; accent-color: var(--accent); }}
         .label {{ color: var(--muted); margin-right: 6px; }}
         .value {{ font-variant-numeric: tabular-nums; font-weight: 600; }}
     </style>
@@ -762,26 +784,36 @@ def _build_animation_html(vehicle_id, df, time_scale):
         <span><span class="label">速度</span><span class="value" id="currentSpeed">-- km/h</span></span>
         <span><span class="label">状态</span><span class="value" id="currentStatus">--</span></span>
         <span><span class="label">进度</span><span class="value" id="progress">0%</span></span>
-        <span><span class="label">当前位置</span><span class="value" id="currentPos">({first['lati']:.6f}, {first['long']:.6f})</span></span>
     </div>
 
     <script>
         var trajectoryData = {payload};
-        var speedMultiplier = {float(time_scale)};
+        var speedBaseMultiplier = 3.0;
+        var speedMultiplier = {float(time_scale)} * speedBaseMultiplier;
         var minDelay = {CONFIG["ANIMATION_MIN_DELAY_MS"]};
-        var maxDelay = {CONFIG["ANIMATION_MAX_DELAY_MS"]};
-        var animationTimer = null;
+        var animationFrameId = null;
         var isPlaying = false;
-        var currentIndex = 0;
-        var traveledPoints = [];
+        var pausedVirtualElapsed = 0;
+        var segmentIndex = 0;
+        var totalDurationMs = 0;
+        var segments = [];
+        var pathLatLngs = [];
+        var basePath = [];
+        var frameGapCapMs = 50;
+        var deltaSmoothingAlpha = 0.18;
+        var lastFrameTimestamp = 0;
+        var smoothedDeltaMs = 16.67;
 
-        var map = L.map('map').setView([{CONFIG["MAP_CENTER"][0]}, {CONFIG["MAP_CENTER"][1]}], {CONFIG["MAP_ZOOM"]});
+        var map = L.map('map', {{preferCanvas: true}}).setView([{CONFIG["MAP_CENTER"][0]}, {CONFIG["MAP_CENTER"][1]}], {CONFIG["MAP_ZOOM"]});
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '&copy; OpenStreetMap contributors'
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 18,
+            tileSize: 512,
+            zoomOffset: -1
         }}).addTo(map);
 
         var previewLine = L.polyline([], {{color: '#9ca3af', weight: 2, opacity: 0.45, dashArray: '6,6'}}).addTo(map);
-        var traveledLine = L.polyline([], {{color: '#16a34a', weight: 5, opacity: 0.88}}).addTo(map);
+        var traveledLine = L.polyline([], {{color: '#16a34a', weight: 5, opacity: 0.9}}).addTo(map);
 
         var markerIcon = L.divIcon({{
             className: 'car-marker',
@@ -794,93 +826,257 @@ def _build_animation_html(vehicle_id, df, time_scale):
         var bounds = L.latLngBounds([[{bounds["minLat"]}, {bounds["minLng"]}], [{bounds["maxLat"]}, {bounds["maxLng"]}]]);
         map.fitBounds(bounds.pad(0.15));
 
-        var staticSegments = [];
-        function addStaticSegments() {{
-            var points = [];
-            for (var i = 0; i < trajectoryData.features.length; i++) {{
-                var f = trajectoryData.features[i];
-                points.push([f.geometry.coordinates[1], f.geometry.coordinates[0]]);
+        function clamp(value, minValue, maxValue) {{
+            return Math.max(minValue, Math.min(maxValue, value));
+        }}
+
+        function lerp(a, b, t) {{
+            return a + (b - a) * t;
+        }}
+
+        function easeLinear(t) {{
+            return t;
+        }}
+
+        function easeInQuad(t) {{
+            return t * t;
+        }}
+
+        function easeOutQuad(t) {{
+            return 1 - (1 - t) * (1 - t);
+        }}
+
+        function easeInOutCubic(t) {{
+            return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }}
+
+        function getEasingDerivative(t) {{
+            var x = clamp(t, 0, 1);
+            return x < 0.5 ? 12 * x * x : 12 * (1 - x) * (1 - x);
+        }}
+
+        function getEasingValue(t) {{
+            return easeInOutCubic(clamp(t, 0, 1));
+        }}
+
+        function buildSegments() {{
+            var features = trajectoryData.features || [];
+            if (features.length < 2) return;
+
+            pathLatLngs = [];
+            totalDurationMs = 0;
+            segments = [];
+
+            for (var i = 0; i < features.length; i++) {{
+                var feature = features[i];
+                var lat = feature.geometry.coordinates[1];
+                var lng = feature.geometry.coordinates[0];
+                var speed = Number(feature.properties.speed || 0);
+                var timeMs = Number(feature.properties.timeMs || 0);
+                pathLatLngs.push([lat, lng]);
+
+                if (i === 0) continue;
+                var prev = features[i - 1];
+                var prevLat = prev.geometry.coordinates[1];
+                var prevLng = prev.geometry.coordinates[0];
+                var prevTimeMs = Number(prev.properties.timeMs || 0);
+                var rawDuration = Math.max(1, timeMs - prevTimeMs);
+                var segmentDistance = haversine(prevLat, prevLng, lat, lng);
+                var duration = rawDuration;
+                var segmentSpeed = 0;
+                if (duration > 0) {{
+                    segmentSpeed = segmentDistance > 0 ? Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, segmentDistance / (duration / 3600000)) : speed;
+                }}
+                segments.push({{
+                    startIndex: i - 1,
+                    endIndex: i,
+                    startLat: prevLat,
+                    startLng: prevLng,
+                    endLat: lat,
+                    endLng: lng,
+                    startSpeed: Number(prev.properties.speed || 0),
+                    endSpeed: speed,
+                    durationMs: duration,
+                    startTimeMs: totalDurationMs,
+                    endTimeMs: totalDurationMs + duration,
+                    speedKmh: segmentSpeed,
+                }});
+                totalDurationMs += duration;
             }}
-            previewLine.setLatLngs(points);
+            previewLine.setLatLngs(pathLatLngs);
+            basePath = pathLatLngs.slice(0, 1);
         }}
 
-        function updateInfo(feature, index) {{
-            var lat = feature.geometry.coordinates[1];
-            var lng = feature.geometry.coordinates[0];
-            document.getElementById('currentTime').textContent = feature.properties.time;
-            document.getElementById('currentSpeed').textContent = feature.properties.speed.toFixed(1) + ' km/h';
-            document.getElementById('currentStatus').textContent = feature.properties.status === 1 ? '载客' : '空载';
-            document.getElementById('progress').textContent = Math.round((index / Math.max(1, trajectoryData.features.length - 1)) * 100) + '%';
-            document.getElementById('currentPos').textContent = '(' + lat.toFixed(6) + ', ' + lng.toFixed(6) + ')';
+        function haversine(lat1, lng1, lat2, lng2) {{
+            var R = 6371.0;
+            function toRad(v) {{ return v * Math.PI / 180; }}
+            var dLat = toRad(lat2 - lat1);
+            var dLng = toRad(lng2 - lng1);
+            var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLng / 2) * Math.sin(dLng / 2);
+            var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
         }}
 
-        function step() {{
-            if (!isPlaying) return;
-            if (currentIndex >= trajectoryData.features.length) {{
-                pauseAnimation();
+        function updatePlaybackInfo(currentElapsed, currentSpeed) {{
+            var progress = totalDurationMs > 0 ? clamp(currentElapsed / totalDurationMs, 0, 1) : 0;
+            document.getElementById('currentSpeed').textContent = formatSpeedValue(currentSpeed) + ' km/h';
+            document.getElementById('progress').textContent = Math.round(progress * 100) + '%';
+        }}
+
+        function formatSpeedValue(speed) {{
+            if (!isFinite(speed) || speed < 0) return '0.00';
+            return speed < 10 ? speed.toFixed(2) : speed.toFixed(1);
+        }}
+
+        function formatTimeFromMs(timeMs) {{
+            var dt = new Date(timeMs);
+            var year = dt.getFullYear();
+            var month = String(dt.getMonth() + 1).padStart(2, '0');
+            var day = String(dt.getDate()).padStart(2, '0');
+            var hour = String(dt.getHours()).padStart(2, '0');
+            var minute = String(dt.getMinutes()).padStart(2, '0');
+            var second = String(dt.getSeconds()).padStart(2, '0');
+            return year + '-' + month + '-' + day + ' ' + hour + ':' + minute + ':' + second;
+        }}
+
+        function updateInfoByPosition(lat, lng, currentElapsed, currentSpeed, status) {{
+            document.getElementById('currentTime').textContent = formatTimeFromMs(trajectoryData.features[0].properties.timeMs + currentElapsed);
+            document.getElementById('currentStatus').textContent = status === 1 ? '载客' : '空载';
+            updatePlaybackInfo(currentElapsed, currentSpeed);
+        }}
+
+        function renderFrame(currentElapsed) {{
+            if (segments.length === 0) return;
+            var total = totalDurationMs;
+            var elapsed = clamp(currentElapsed, 0, total);
+
+            while (segmentIndex < segments.length - 1 && elapsed > segments[segmentIndex].endTimeMs) {{
+                segmentIndex += 1;
+            }}
+            while (segmentIndex > 0 && elapsed < segments[segmentIndex].startTimeMs) {{
+                segmentIndex -= 1;
+            }}
+
+            var segment = segments[segmentIndex];
+            var localElapsed = elapsed - segment.startTimeMs;
+            var rawT = segment.durationMs > 0 ? clamp(localElapsed / segment.durationMs, 0, 1) : 1;
+            var easedT = getEasingValue(rawT);
+            var lat = lerp(segment.startLat, segment.endLat, easedT);
+            var lng = lerp(segment.startLng, segment.endLng, easedT);
+            var motionFactor = getEasingDerivative(rawT);
+            var currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh * motionFactor));
+            var status = trajectoryData.features[segment.startIndex].properties.status;
+
+            traveledLine.setLatLngs(pathLatLngs.slice(0, segment.startIndex + 1).concat([[lat, lng]]));
+            carMarker.setLatLng([lat, lng]);
+            updateInfoByPosition(lat, lng, elapsed, currentSpeed, status);
+        }}
+
+        function tick(currentTime) {{
+            if (!isPlaying) {{
                 return;
             }}
 
-            var feature = trajectoryData.features[currentIndex];
-            var latlng = [feature.geometry.coordinates[1], feature.geometry.coordinates[0]];
-            traveledPoints.push(latlng);
-            traveledLine.setLatLngs(traveledPoints);
-            carMarker.setLatLng(latlng);
-            updateInfo(feature, currentIndex);
-            currentIndex += 1;
+            if (!lastFrameTimestamp) {{
+                lastFrameTimestamp = currentTime;
+            }}
 
-            if (currentIndex >= trajectoryData.features.length) {{
-                pauseAnimation();
+            var deltaReal = currentTime - lastFrameTimestamp;
+            lastFrameTimestamp = currentTime;
+
+            if (!isFinite(deltaReal) || deltaReal < 0) {{
+                deltaReal = 0;
+            }}
+
+            var cappedDelta = clamp(deltaReal, 0, frameGapCapMs);
+            smoothedDeltaMs = smoothedDeltaMs > 0
+                ? (smoothedDeltaMs * (1 - deltaSmoothingAlpha) + cappedDelta * deltaSmoothingAlpha)
+                : cappedDelta;
+
+            var virtualElapsed = pausedVirtualElapsed + smoothedDeltaMs * speedMultiplier;
+            if (!isFinite(virtualElapsed)) {{
+                virtualElapsed = pausedVirtualElapsed;
+            }}
+
+            if (virtualElapsed >= totalDurationMs) {{
+                pausedVirtualElapsed = totalDurationMs;
+                renderFrame(totalDurationMs);
+                isPlaying = false;
+                if (animationFrameId) {{
+                    cancelAnimationFrame(animationFrameId);
+                    animationFrameId = null;
+                }}
                 return;
             }}
 
-            var prev = trajectoryData.features[currentIndex - 1];
-            var next = trajectoryData.features[currentIndex];
-            var prevTime = new Date(prev.properties.time);
-            var nextTime = new Date(next.properties.time);
-            var timeDiff = Math.max(0, nextTime - prevTime);
-            var delay = timeDiff > 0 ? timeDiff / speedMultiplier : minDelay;
-            delay = Math.max(minDelay, Math.min(maxDelay, delay));
-            animationTimer = setTimeout(step, delay);
+            pausedVirtualElapsed = virtualElapsed;
+            renderFrame(virtualElapsed);
+            animationFrameId = requestAnimationFrame(tick);
         }}
+
+        function handleVisibilityChange() {{
+            if (document.hidden) {{
+                lastFrameTimestamp = 0;
+            }} else if (isPlaying) {{
+                lastFrameTimestamp = performance.now();
+            }}
+        }}
+
+        document.addEventListener('visibilitychange', handleVisibilityChange);
 
         function playAnimation() {{
             if (isPlaying) return;
+
             isPlaying = true;
-            if (currentIndex >= trajectoryData.features.length) {{
-                currentIndex = Math.max(0, trajectoryData.features.length - 1);
+            if (pausedVirtualElapsed >= totalDurationMs) {{
+                pausedVirtualElapsed = 0;
+                segmentIndex = 0;
             }}
-            step();
+
+            lastFrameTimestamp = performance.now();
+            smoothedDeltaMs = 16.67;
+            animationFrameId = requestAnimationFrame(tick);
         }}
 
         function pauseAnimation() {{
             isPlaying = false;
-            if (animationTimer) {{
-                clearTimeout(animationTimer);
-                animationTimer = null;
+            if (animationFrameId) {{
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
             }}
         }}
 
         function resetAnimation() {{
             pauseAnimation();
-            currentIndex = 0;
-            traveledPoints = [];
-            traveledLine.setLatLngs([]);
-            if (trajectoryData.features.length > 0) {{
+            pausedVirtualElapsed = 0;
+            segmentIndex = 0;
+            lastFrameTimestamp = 0;
+            smoothedDeltaMs = 16.67;
+            if (trajectoryData.features.length > 0 && pathLatLngs.length > 0) {{
                 var first = trajectoryData.features[0];
-                var firstLatLng = [first.geometry.coordinates[1], first.geometry.coordinates[0]];
+                var firstLatLng = pathLatLngs[0];
                 carMarker.setLatLng(firstLatLng);
-                updateInfo(first, 0);
+                traveledLine.setLatLngs([firstLatLng]);
+                updateInfoByPosition(firstLatLng[0], firstLatLng[1], first, 0, Number(first.properties.speed || 0));
                 document.getElementById('progress').textContent = '0%';
             }}
         }}
 
         function updateSpeed() {{
-            speedMultiplier = parseFloat(document.getElementById('speedSlider').value);
-            document.getElementById('speedValue').textContent = speedMultiplier.toFixed(1) + 'x';
+            if (isPlaying) {{
+                lastFrameTimestamp = performance.now();
+            }}
+            var selectedSpeed = parseFloat(document.getElementById('speedSlider').value);
+            speedMultiplier = selectedSpeed * speedBaseMultiplier;
+            document.getElementById('speedValue').textContent = selectedSpeed.toFixed(1) + 'x';
+            if (!isPlaying) {{
+                renderFrame(pausedVirtualElapsed);
+            }}
         }}
 
-        addStaticSegments();
+        buildSegments();
         resetAnimation();
     </script>
 </body>
