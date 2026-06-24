@@ -2,3 +2,5 @@
 *.csv
 *.log
 *.pkl
+*.txt
+*.html
