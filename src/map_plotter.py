@@ -249,10 +249,17 @@ def _read_minute_cache(minute_file):
 
 
 @lru_cache(maxsize=8)
-def _read_od_cache(od_path):
+def _read_od_cache(od_path, version_key=None):
     if not os.path.exists(od_path):
         return None
     return normalize_od_df(pd.read_csv(od_path))
+
+
+def _file_version_key(path):
+    if not os.path.exists(path):
+        return "missing"
+    stat = os.stat(path)
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
 
 
 def add_shenzhen_boundary(m):
@@ -1545,7 +1552,7 @@ def plot_minute_vehicles(target_time, vehicle_id=None, vehicle_ids=None, save_pa
 
 
 def load_od_data(start_time, end_time, vehicle_id=None, vehicle_ids=None):
-    cached = _read_od_cache(CONFIG["OD_TABLE_PATH"])
+    cached = _read_od_cache(CONFIG["OD_TABLE_PATH"], _file_version_key(CONFIG["OD_TABLE_PATH"]))
     if cached is None:
         log.error("OD表文件不存在: %s", CONFIG["OD_TABLE_PATH"])
         return None

@@ -16,12 +16,23 @@ import logging
 import os
 import sys
 from textwrap import dedent
-from textwrap import dedent
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from heatmap_analysis import (  # noqa: E402
+    aggregate_minute_range_fast,
+    build_dynamic_heatmap,
+    build_static_heatmap,
+    cached_standardize_heatmap_source,
+    compute_daily_operation_statistics,
+    compute_order_statistics,
+    export_statistics_bundle,
+    recommend_dbscan_params,
+    run_pickup_cluster_analysis,
+)
 from map_plotter import (  # noqa: E402
     CONFIG,
     load_minute_data,
@@ -40,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
-VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注"]
+VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析"]
 
 
 DEFAULTS = {
@@ -55,6 +66,27 @@ DEFAULTS = {
     "ref_lng": float(CONFIG["MAP_CENTER"][1]),
     "active_view": "轨迹查询",
     "last_query": None,
+    "heatmap_source": "pickup",
+    "heatmap_enable_cluster": False,
+    "heatmap_eps_km": 0.35,
+    "heatmap_min_samples": 8,
+    "heatmap_threshold_quantile": 0.92,
+    "dynamic_source": "pickup",
+    "dynamic_granularity": 15,
+    "dynamic_smoothing": "EMA",
+    "dynamic_ema_alpha": 0.55,
+    "dynamic_wma_window": 3,
+    "dynamic_threshold_quantile": 0.92,
+    "pickup_cluster_eps_km": 0.35,
+    "pickup_cluster_min_samples": 8,
+    "pickup_cluster_threshold_quantile": 0.92,
+    "heatmap_analysis_panel": "静态热力图",
+    "static_heatmap_request": None,
+    "dynamic_heatmap_request": None,
+    "pickup_cluster_request": None,
+    "order_stats_request": None,
+    "operation_stats_request": None,
+    "last_active_view": "轨迹查询",
 }
 
 
@@ -228,6 +260,8 @@ def init_state():
     for key, value in DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if st.session_state.get("active_view") in {"05 热力图与统计分析", "06 下一阶段"}:
+        st.session_state["active_view"] = "热力图与统计分析"
 
 
 def reset_to_defaults():
@@ -250,6 +284,96 @@ def cached_minute_data(minute_time):
 @st.cache_data(show_spinner=False, ttl=300)
 def cached_od_data(start_time, end_time, vehicle_id=None, vehicle_ids=None):
     return load_od_data(start_time, end_time, vehicle_id, vehicle_ids=vehicle_ids)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_source_recommendation(source_type, start_time, end_time, vehicle_ids=None):
+    if source_type == "minute":
+        points_df, meta = aggregate_minute_range_fast(start_time, end_time, vehicle_ids=vehicle_ids, precision=4, time_bucket_minutes=None)
+        if points_df is None or len(points_df) == 0:
+            return {"eps_km": 0.35, "min_samples": 8}, meta
+        sample_df = points_df[["lat", "lng", "weight", "time_start"]].rename(columns={"time_start": "time"}).copy()
+        return recommend_dbscan_params(sample_df.assign(point_count=1)), meta
+
+    std_df, meta = cached_standardize_heatmap_source(source_type, start_time, end_time, vehicle_ids=vehicle_ids)
+    if std_df is None or len(std_df) == 0:
+        return {"eps_km": 0.35, "min_samples": 8}, meta
+    return recommend_dbscan_params(std_df[["lat", "lng", "weight", "time"]].assign(point_count=1)), meta
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_static_heatmap(
+    source_type,
+    start_time,
+    end_time,
+    vehicle_ids=None,
+    enable_cluster=False,
+    eps_km=0.35,
+    min_samples=8,
+    threshold_quantile=0.92,
+):
+    return build_static_heatmap(
+        source_type=source_type,
+        start_time=start_time,
+        end_time=end_time,
+        vehicle_ids=vehicle_ids,
+        enable_cluster=enable_cluster,
+        eps_km=eps_km,
+        min_samples=min_samples,
+        threshold_quantile=threshold_quantile,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_dynamic_heatmap(
+    source_type,
+    start_time,
+    end_time,
+    requested_granularity=15,
+    vehicle_ids=None,
+    smoothing_method="EMA",
+    ema_alpha=0.55,
+    wma_window=3,
+    threshold_quantile=0.92,
+):
+    return build_dynamic_heatmap(
+        source_type=source_type,
+        start_time=start_time,
+        end_time=end_time,
+        requested_granularity=requested_granularity,
+        vehicle_ids=vehicle_ids,
+        smoothing_method=smoothing_method,
+        ema_alpha=ema_alpha,
+        wma_window=wma_window,
+        threshold_quantile=threshold_quantile,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_order_statistics(start_time, end_time, vehicle_ids=None):
+    return compute_order_statistics(start_time, end_time, vehicle_ids=vehicle_ids)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_daily_operation_statistics(query_date, vehicle_ids=None):
+    return compute_daily_operation_statistics(query_date, vehicle_ids=vehicle_ids)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_pickup_cluster_analysis(start_time, end_time, vehicle_ids=None, eps_km=0.35, min_samples=8, threshold_quantile=0.92):
+    return run_pickup_cluster_analysis(
+        start_time=start_time,
+        end_time=end_time,
+        vehicle_ids=vehicle_ids,
+        eps_km=eps_km,
+        min_samples=min_samples,
+        threshold_quantile=threshold_quantile,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_export_bundle(query_date, order_stats, operation_stats, cluster_result=None):
+    return export_statistics_bundle(query_date, order_stats, operation_stats, cluster_result=cluster_result)
 
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -424,6 +548,7 @@ def sidebar_form():
         - 分钟位置：读取分钟缓存，查看某一分钟的车辆分布
         - OD 点标注：展示上车点和下车点，并自动区分线路
         - 动画轨迹：在动画页面中按时间顺序播放单车运动，并显示速度变化
+        - 热力图与统计分析：新增静态/动态热力图、订单统计、车辆运营统计与上车点聚类分析
         """
     )
 
@@ -821,6 +946,424 @@ def render_query_status(payload):
         st.caption("当前为全部车辆模式，结果将按时间范围查询并展示汇总预览。")
 
 
+def _source_label(source_type):
+    return "分钟缓存车辆位置" if source_type == "minute" else "OD 上车点"
+
+
+def _normalize_vehicle_scope(vehicle_ids):
+    return tuple(vehicle_ids or ())
+
+
+def _resolve_heatmap_vehicle_scope(source_type, selected_vehicle_ids):
+    if source_type == "minute":
+        return ()
+    return tuple(selected_vehicle_ids or ())
+
+
+def render_static_heatmap_tab(payload):
+    st.markdown("#### 静态热力图")
+    selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+
+    with st.form("static_heatmap_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            selected_source_type = st.selectbox(
+                "数据来源",
+                options=["minute", "pickup"],
+                key="heatmap_source",
+                format_func=_source_label,
+                help="分钟缓存表示车辆位置累计分布，OD 上车点表示乘客上车需求累计分布。",
+            )
+        with c2:
+            enable_cluster = st.checkbox("启用聚类热力图", key="heatmap_enable_cluster")
+        with c3:
+            threshold_quantile = st.slider("热度阈值分位数", 0.50, 0.99, key="heatmap_threshold_quantile", step=0.01, help="用于裁剪过高权重，避免全图过热。")
+
+        c6, c7 = st.columns(2)
+        with c6:
+            eps_km = st.number_input("聚类半径 eps(km)", min_value=0.05, max_value=2.0, step=0.05, key="heatmap_eps_km", format="%.2f")
+        with c7:
+            min_samples = st.number_input("最小样本数 min_samples", min_value=2, max_value=50, step=1, key="heatmap_min_samples")
+        st.caption("聚类参数仅在启用聚类时生效。聚类后热力值定义为簇内空间聚合点权重之和。")
+        submitted = st.form_submit_button("生成静态热力图", use_container_width=True, type="primary")
+
+    if submitted or st.session_state["static_heatmap_request"] is None:
+        request_vehicle_ids = _resolve_heatmap_vehicle_scope(selected_source_type, selected_vehicle_ids)
+        st.session_state["static_heatmap_request"] = {
+            "source_type": selected_source_type,
+            "enable_cluster": bool(enable_cluster),
+            "eps_km": float(eps_km),
+            "min_samples": int(min_samples),
+            "threshold_quantile": float(threshold_quantile),
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+            "vehicle_ids": request_vehicle_ids,
+        }
+
+    request = st.session_state["static_heatmap_request"]
+    if request and request["source_type"] == "minute" and request.get("vehicle_ids"):
+        request = {**request, "vehicle_ids": ()}
+        st.session_state["static_heatmap_request"] = request
+    st.caption("参数调整不会立即重算，点击“生成静态热力图”后才会执行。")
+    rec, _ = cached_source_recommendation(
+        request["source_type"],
+        request["start_time"],
+        request["end_time"],
+        request["vehicle_ids"] or None,
+    )
+    st.caption(
+        f"当前执行来源 {_source_label(request['source_type'])}；推荐 DBSCAN 参数 eps≈{rec['eps_km']} km, min_samples≈{rec['min_samples']}。"
+    )
+    if request["source_type"] == "minute":
+        st.caption("分钟缓存车辆位置热力图固定按全部车辆统计，不受左侧车辆ID筛选影响。")
+    else:
+        st.caption("OD 上车点热力图会按当前车辆ID筛选结果执行。")
+
+    with st.spinner("正在生成静态热力图..."):
+        html_path, info = cached_static_heatmap(
+            source_type=request["source_type"],
+            start_time=request["start_time"],
+            end_time=request["end_time"],
+            vehicle_ids=request["vehicle_ids"] or None,
+            enable_cluster=request["enable_cluster"],
+            eps_km=request["eps_km"],
+            min_samples=request["min_samples"],
+            threshold_quantile=request["threshold_quantile"],
+        )
+
+    if not html_path:
+        st.warning("当前条件下没有可用于静态热力图的数据。")
+        return
+
+    cols = st.columns(4)
+    metrics = [
+        ("原始点数", info.get("input_points", 0)),
+        ("聚合热力点", info.get("heat_points", 0)),
+        ("聚类簇数", info.get("cluster_count", 0) if request["enable_cluster"] else "未启用"),
+        ("阈值上限", f"{info.get('threshold_cap', 0.0):.2f}"),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.metric(label, value)
+
+    filter_stats = info.get("filter_stats", {})
+    st.caption(
+        f"来源标识: {info.get('source_label', '--')}；边界过滤 {filter_stats.get('bounds_removed', 0)} 点，"
+        f"漂移过滤 {filter_stats.get('drift_removed', 0)} 点，输出地图 {info.get('output_path', '--')}。"
+    )
+    render_html_map(html_path, height=760)
+
+
+def render_dynamic_heatmap_tab(payload):
+    st.markdown("#### 动态热力图")
+    selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+
+    with st.form("dynamic_heatmap_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.selectbox("数据来源", ["minute", "pickup"], key="dynamic_source", format_func=_source_label)
+        with c2:
+            st.selectbox("时间粒度", [1, 15, 30, 60], key="dynamic_granularity", format_func=lambda x: f"{x} 分钟")
+        with c3:
+            st.selectbox("平滑算法", ["EMA", "WMA"], key="dynamic_smoothing")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            st.slider("热度阈值分位数", 0.50, 0.99, key="dynamic_threshold_quantile", step=0.01)
+        with c5:
+            st.slider("EMA alpha", 0.10, 0.95, key="dynamic_ema_alpha", step=0.05)
+        with c6:
+            st.slider("WMA 窗口", 2, 8, key="dynamic_wma_window")
+        st.caption("动态热力图时间片结构为 `[{time, points:[[lat, lon, weight], ...]}]`，分钟级请求过密时会自动提升到 15/30/60 分钟聚合。")
+        submitted = st.form_submit_button("生成动态热力图", use_container_width=True, type="primary")
+
+    if submitted:
+        dynamic_source_type = st.session_state["dynamic_source"]
+        request_vehicle_ids = _resolve_heatmap_vehicle_scope(dynamic_source_type, selected_vehicle_ids)
+        st.session_state["dynamic_heatmap_request"] = {
+            "source_type": dynamic_source_type,
+            "requested_granularity": int(st.session_state["dynamic_granularity"]),
+            "vehicle_ids": request_vehicle_ids,
+            "smoothing_method": st.session_state["dynamic_smoothing"],
+            "ema_alpha": float(st.session_state["dynamic_ema_alpha"]),
+            "wma_window": int(st.session_state["dynamic_wma_window"]),
+            "threshold_quantile": float(st.session_state["dynamic_threshold_quantile"]),
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+        }
+
+    request = st.session_state["dynamic_heatmap_request"]
+    if request and request["source_type"] == "minute" and request.get("vehicle_ids"):
+        request = {**request, "vehicle_ids": ()}
+        st.session_state["dynamic_heatmap_request"] = request
+    if request is None:
+        st.info("当前仅显示动态热力图配置。点击“生成动态热力图”后才会开始加载和渲染。")
+        return
+    st.caption("参数调整不会立即重算，点击“生成动态热力图”后才会执行。")
+    if request["source_type"] == "minute":
+        st.caption("分钟缓存车辆位置动态热力图固定按全部车辆统计，不受左侧车辆ID筛选影响。")
+    else:
+        st.caption("OD 上车点动态热力图会按当前车辆ID筛选结果执行。")
+    with st.spinner("正在生成动态热力图..."):
+        html_path, info = cached_dynamic_heatmap(
+            source_type=request["source_type"],
+            start_time=request["start_time"],
+            end_time=request["end_time"],
+            requested_granularity=request["requested_granularity"],
+            vehicle_ids=request["vehicle_ids"] or None,
+            smoothing_method=request["smoothing_method"],
+            ema_alpha=request["ema_alpha"],
+            wma_window=request["wma_window"],
+            threshold_quantile=request["threshold_quantile"],
+        )
+
+    if not html_path:
+        st.warning("当前条件下没有可用于动态热力图的数据。")
+        return
+
+    granularity = info.get("granularity", {})
+    animation_profile = info.get("animation_profile", {})
+    cols = st.columns(4)
+    metrics = [
+        ("请求粒度", f"{granularity.get('requested_minutes', '--')} 分钟"),
+        ("实际粒度", f"{granularity.get('actual_minutes', '--')} 分钟"),
+        ("时间片数", granularity.get("estimated_slices", 0)),
+        ("动画配置", f"{animation_profile.get('target_fps', 60)}fps / {animation_profile.get('transition_ms', '--')}ms"),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.metric(label, value)
+
+    if granularity.get("auto_adjusted"):
+        st.info(
+            f"为避免一次加载过多时间片，系统已将动态热力图从 {granularity.get('requested_minutes')} 分钟自动调整为 "
+            f"{granularity.get('actual_minutes')} 分钟聚合。"
+        )
+
+    time_slices = info.get("time_slices", [])
+    preview_slice = time_slices[0]["points"][:3] if time_slices else []
+    st.caption(
+        f"来源标识: {info.get('source_label', '--')}；平滑算法 {info.get('smoothing_method', '--')}；时间片数 {len(time_slices)}；首片样例 {preview_slice if preview_slice else '[]'}；"
+        f"导出地图 {info.get('output_path', '--')}。"
+    )
+    render_html_map(html_path, height=760)
+
+
+def render_order_statistics_tab(payload):
+    st.markdown("#### 订单统计分析")
+    selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+    with st.form("order_stats_form", clear_on_submit=False):
+        submitted = st.form_submit_button("生成订单统计", use_container_width=True, type="primary")
+
+    if submitted:
+        st.session_state["order_stats_request"] = {
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+            "vehicle_ids": selected_vehicle_ids,
+        }
+
+    request = st.session_state["order_stats_request"]
+    if request is None:
+        st.info("当前仅显示订单统计配置。点击“生成订单统计”后才会开始计算。")
+        return
+    st.caption("切换功能模块时不会重新计算订单统计；只有点击“生成订单统计”才会更新结果。")
+    with st.spinner("正在计算订单统计..."):
+        stats = cached_order_statistics(request["start_time"], request["end_time"], request["vehicle_ids"] or None)
+
+    summary = stats["summary"]
+    cols = st.columns(4)
+    metrics = [
+        ("订单数", summary["order_count"]),
+        ("平均里程", f"{summary['avg_distance_km']:.2f} km"),
+        ("载客车辆峰值", summary["occupied_vehicle_peak"]),
+        ("载客率峰值", f"{summary['occupancy_rate_peak'] * 100:.1f}%"),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.metric(label, value)
+
+    hourly_df = stats["hourly"].copy()
+    if len(hourly_df):
+        hourly_df["hour_label"] = pd.to_datetime(hourly_df["hour"]).dt.strftime("%H:%M")
+        order_chart = (
+            alt.Chart(hourly_df)
+            .mark_line(point=True, color="#d97706")
+            .encode(x=alt.X("hour_label:N", title="小时"), y=alt.Y("order_count:Q", title="订单数"))
+            .properties(height=280, title="小时订单数趋势")
+        )
+        vehicle_chart = (
+            alt.Chart(hourly_df)
+            .mark_line(point=True, color="#2563eb")
+            .encode(x=alt.X("hour_label:N", title="小时"), y=alt.Y("occupied_vehicles:Q", title="载客车辆数"))
+            .properties(height=280, title="小时载客车辆数趋势")
+        )
+        occupancy_chart = (
+            alt.Chart(hourly_df)
+            .mark_area(line={"color": "#16a34a"}, color="#86efac", opacity=0.55)
+            .encode(x=alt.X("hour_label:N", title="小时"), y=alt.Y("occupancy_rate:Q", title="载客率", axis=alt.Axis(format="%")))
+            .properties(height=280, title="小时载客率趋势")
+        )
+        st.altair_chart(order_chart, use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.altair_chart(vehicle_chart, use_container_width=True)
+        with c2:
+            st.altair_chart(occupancy_chart, use_container_width=True)
+    else:
+        st.info("当前时间范围内没有可视化的小时统计结果。")
+
+    bucket_df = stats["distance_buckets"].copy()
+    if len(bucket_df):
+        bucket_chart = (
+            alt.Chart(bucket_df)
+            .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6, color="#0f766e")
+            .encode(x=alt.X("里程区间:N", title="里程区间"), y=alt.Y("订单数:Q", title="订单数"), tooltip=["里程区间", "订单数", alt.Tooltip("占比:Q", format=".2%")])
+            .properties(height=260, title="订单里程结构")
+        )
+        st.altair_chart(bucket_chart, use_container_width=True)
+        st.dataframe(bucket_df, use_container_width=True, hide_index=True)
+
+    st.caption(f"统计口径: {stats.get('stat_definition', '--')} 分钟明细行数 {stats.get('minute_rows', 0)}，OD 行数 {stats.get('od_rows', 0)}。")
+
+
+def render_operation_statistics_tab(payload):
+    st.markdown("#### 车辆运营统计")
+    selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+    with st.form("operation_stats_form", clear_on_submit=False):
+        submitted = st.form_submit_button("生成车辆运营统计", use_container_width=True, type="primary")
+
+    if submitted:
+        st.session_state["operation_stats_request"] = {
+            "query_date": payload["start_time"].date(),
+            "vehicle_ids": selected_vehicle_ids,
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+        }
+
+    request = st.session_state["operation_stats_request"]
+    if request is None:
+        st.info("当前仅显示车辆运营统计配置。点击“生成车辆运营统计”后才会开始计算。")
+        return
+    st.caption("切换功能模块时不会重新计算车辆运营统计；只有点击“生成车辆运营统计”才会更新结果。")
+    with st.spinner("正在计算全天运营统计..."):
+        operation_stats = cached_daily_operation_statistics(request["query_date"], request["vehicle_ids"] or None)
+
+    cols = st.columns(4)
+    metrics = [
+        ("运营车辆数", operation_stats["vehicle_count"]),
+        ("全天载客率", f"{operation_stats['occupancy_ratio'] * 100:.2f}%"),
+        ("总里程估计", f"{operation_stats['total_distance_km']:.2f} km"),
+        ("空载里程估计", f"{operation_stats['empty_distance_km']:.2f} km"),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.metric(label, value)
+
+    st.dataframe(operation_stats["summary_table"], use_container_width=True, hide_index=True)
+    st.caption(f"统计口径: {operation_stats.get('stat_definition', '--')}")
+
+    if st.button("导出统计结果为 CSV / Excel", use_container_width=True):
+        order_stats = cached_order_statistics(request["start_time"], request["end_time"], request["vehicle_ids"] or None)
+        cluster_result = cached_pickup_cluster_analysis(
+            request["start_time"],
+            request["end_time"],
+            request["vehicle_ids"] or None,
+            float(st.session_state["pickup_cluster_eps_km"]),
+            int(st.session_state["pickup_cluster_min_samples"]),
+            float(st.session_state["pickup_cluster_threshold_quantile"]),
+        )
+        export_info = cached_export_bundle(request["query_date"], order_stats, operation_stats, cluster_result)
+        st.success(f"统计结果已导出到: {export_info['export_dir']}")
+        st.caption(f"CSV: {' | '.join(export_info['csv_files'])}")
+        st.caption(f"Excel: {export_info['xlsx_file']}")
+
+
+def render_pickup_cluster_tab(payload):
+    st.markdown("#### 上车点聚类分析")
+    selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+    rec, _ = cached_source_recommendation("pickup", payload["start_time"], payload["end_time"], selected_vehicle_ids or None)
+
+    with st.form("pickup_cluster_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.number_input("eps(km)", min_value=0.05, max_value=2.0, step=0.05, key="pickup_cluster_eps_km", format="%.2f")
+        with c2:
+            st.number_input("min_samples", min_value=2, max_value=50, step=1, key="pickup_cluster_min_samples")
+        with c3:
+            st.slider("热度阈值分位数", 0.50, 0.99, key="pickup_cluster_threshold_quantile", step=0.01)
+        st.caption(
+            f"参数建议: eps≈{rec['eps_km']} km, min_samples≈{rec['min_samples']}。聚类热力值定义为簇内上车订单累计权重，地图按聚类中心而非原始点渲染。"
+        )
+        submitted = st.form_submit_button("执行上车点聚类", use_container_width=True, type="primary")
+
+    if submitted or st.session_state["pickup_cluster_request"] is None:
+        st.session_state["pickup_cluster_request"] = {
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+            "vehicle_ids": selected_vehicle_ids,
+            "eps_km": float(st.session_state["pickup_cluster_eps_km"]),
+            "min_samples": int(st.session_state["pickup_cluster_min_samples"]),
+            "threshold_quantile": float(st.session_state["pickup_cluster_threshold_quantile"]),
+        }
+
+    request = st.session_state["pickup_cluster_request"]
+    st.caption("参数调整不会立即重算，点击“执行上车点聚类”后才会执行。")
+    with st.spinner("正在执行上车点 DBSCAN 聚类..."):
+        cluster_result = cached_pickup_cluster_analysis(
+            request["start_time"],
+            request["end_time"],
+            request["vehicle_ids"] or None,
+            request["eps_km"],
+            request["min_samples"],
+            request["threshold_quantile"],
+        )
+
+    clusters = cluster_result.get("clusters", pd.DataFrame())
+    if len(clusters) == 0:
+        st.warning("当前条件下未形成有效聚类簇，请尝试放宽时间范围或调大 eps。")
+        return
+
+    cols = st.columns(4)
+    metrics = [
+        ("聚类簇数", len(clusters)),
+        ("最大热力值", f"{clusters['heat_value'].max():.0f}"),
+        ("平均热力值", f"{clusters['heat_value'].mean():.1f}"),
+        ("噪声点数", len(cluster_result.get('noise', pd.DataFrame()))),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.metric(label, value)
+
+    st.caption(
+        f"来源标识: {cluster_result['meta'].get('source_label', '--')}；热力值定义: {cluster_result['meta'].get('cluster_heat_value_definition', '--')}；"
+        f"地图输出 {cluster_result['meta'].get('output_path', '--')}。"
+    )
+    render_html_map(cluster_result.get("map_path"), height=760)
+    st.dataframe(clusters, use_container_width=True, hide_index=True)
+
+
+def render_heatmap_stats_view(payload):
+    st.subheader("热力图与统计分析")
+    selected_panel = st.radio(
+        "分析功能",
+        ["静态热力图", "动态热力图", "订单统计", "车辆运营", "上车点聚类"],
+        key="heatmap_analysis_panel",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if selected_panel == "静态热力图":
+        render_static_heatmap_tab(payload)
+    elif selected_panel == "动态热力图":
+        render_dynamic_heatmap_tab(payload)
+    elif selected_panel == "订单统计":
+        render_order_statistics_tab(payload)
+    elif selected_panel == "车辆运营":
+        render_operation_statistics_tab(payload)
+    elif selected_panel == "上车点聚类":
+        render_pickup_cluster_tab(payload)
+
+
 def main():
     try:
         init_page()
@@ -839,6 +1382,11 @@ def main():
                     st.error(error)
                 return
             st.session_state["last_query"] = payload
+            st.session_state["static_heatmap_request"] = None
+            st.session_state["dynamic_heatmap_request"] = None
+            st.session_state["pickup_cluster_request"] = None
+            st.session_state["order_stats_request"] = None
+            st.session_state["operation_stats_request"] = None
             st.success("查询条件已更新。")
 
         active_payload = st.session_state.get("last_query", payload)
@@ -853,6 +1401,11 @@ def main():
             label_visibility="collapsed",
         )
 
+        previous_active_view = st.session_state.get("last_active_view")
+        if active_view == "热力图与统计分析" and previous_active_view != "热力图与统计分析":
+            st.session_state["heatmap_analysis_panel"] = "静态热力图"
+        st.session_state["last_active_view"] = active_view
+
         if active_view == "轨迹查询":
             render_trajectory_view(active_payload)
         elif active_view == "动画轨迹":
@@ -861,9 +1414,11 @@ def main():
             render_minute_view(active_payload)
         elif active_view == "OD点标注":
             render_od_view(active_payload)
+        elif active_view == "热力图与统计分析":
+            render_heatmap_stats_view(active_payload)
 
         st.markdown("---")
-        st.caption("数据来源: cache/vehicles/ | cache/minutes/ | data/processed/od_table.csv")
+        st.caption("数据来源: cache/vehicles/ | cache/minutes/ | data/processed/od_table.csv | exports/heatmap_stats/")
     except Exception:
         logger.exception("页面主流程错误")
         st.error("页面加载失败，请稍后重试。")

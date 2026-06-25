@@ -1,7 +1,12 @@
 .DS_Store
+__pycache__/
+*.pyc
 *.csv
+*.xlsx
 *.log
 *.pkl
 *.txt
 *.html
 *.json
+*.xlsx
+exports/
