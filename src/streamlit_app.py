@@ -4,7 +4,7 @@
 出租车GPS轨迹查询系统
 
 单页集成：
-1. 按车辆ID和时间范围查询轨迹
+1. 按车辆ID和时间范围查询轨迹，支持最多 10 辆车并行展示
 2. 按分钟查询所有车辆或指定车辆位置
 3. 标注上车点和下车点
 4. 单车动画轨迹播放
@@ -15,7 +15,10 @@ from datetime import datetime, time
 import logging
 import os
 import sys
+from textwrap import dedent
+from textwrap import dedent
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,8 +28,10 @@ from map_plotter import (  # noqa: E402
     load_od_data,
     load_vehicle_trajectory,
     plot_animated_trajectory,
+    plot_multi_vehicle_animated_trajectory,
     plot_minute_vehicles,
     plot_od_points,
+    plot_vehicle_trajectories,
     plot_vehicle_trajectory,
 )
 
@@ -41,13 +46,11 @@ VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注"]
 DEFAULTS = {
     "vehicle_id": "22223",
     "query_date": datetime(2023, 10, 12).date(),
-    "start_hour": 8,
-    "start_minute": 0,
-    "end_hour": 10,
-    "end_minute": 0,
-    "minute_hour": 9,
-    "minute_minute": 30,
+    "start_time_of_day": "08:00",
+    "end_time_of_day": "10:00",
+    "minute_time_of_day": "09:30",
     "time_scale": 2.0,
+    "trajectory_vehicle_ids": [],
     "ref_lat": float(CONFIG["MAP_CENTER"][0]),
     "ref_lng": float(CONFIG["MAP_CENTER"][1]),
     "active_view": "轨迹查询",
@@ -108,6 +111,7 @@ def init_page():
         [data-testid="stSidebar"] .stTextInput input,
         [data-testid="stSidebar"] .stNumberInput input,
         [data-testid="stSidebar"] .stDateInput input,
+        [data-testid="stSidebar"] .stTextInput input,
         [data-testid="stSidebar"] .stSelectbox div,
         [data-testid="stSidebar"] .stSlider {
             background: #ffffff !important;
@@ -125,6 +129,18 @@ def init_page():
         .stTimeInput input {
             border: 1px solid var(--border) !important;
             border-radius: 10px !important;
+        }
+
+        [data-testid="stSidebar"] .stTimeInput input {
+            color: var(--text) !important;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+
+        [data-testid="stSidebar"] .stTextInput input {
+            color: var(--text) !important;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
         }
 
         .hero {
@@ -232,8 +248,25 @@ def cached_minute_data(minute_time):
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def cached_od_data(start_time, end_time, vehicle_id):
-    return load_od_data(start_time, end_time, vehicle_id)
+def cached_od_data(start_time, end_time, vehicle_id=None, vehicle_ids=None):
+    return load_od_data(start_time, end_time, vehicle_id, vehicle_ids=vehicle_ids)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_available_vehicle_ids():
+    if not os.path.isdir(CONFIG["VEHICLE_CACHE_DIR"]):
+        return []
+
+    vehicle_ids = []
+    for filename in os.listdir(CONFIG["VEHICLE_CACHE_DIR"]):
+        if filename.lower().endswith(".csv"):
+            vehicle_ids.append(os.path.splitext(filename)[0])
+
+    def sort_key(value):
+        value = str(value)
+        return (0, int(value)) if value.isdigit() else (1, value)
+
+    return sorted(set(vehicle_ids), key=sort_key)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -275,31 +308,47 @@ def apply_vehicle_time_range(vehicle_id):
     start_time = time_range["min_time"].time().replace(microsecond=0)
     end_time = time_range["max_time"].time().replace(microsecond=0)
     st.session_state["query_date"] = time_range["min_time"].date()
-    st.session_state["start_hour"] = start_time.hour
-    st.session_state["start_minute"] = start_time.minute
-    st.session_state["end_hour"] = end_time.hour
-    st.session_state["end_minute"] = end_time.minute
-    st.session_state["minute_hour"] = start_time.hour
-    st.session_state["minute_minute"] = start_time.minute
+    st.session_state["start_time_of_day"] = start_time.strftime("%H:%M")
+    st.session_state["end_time_of_day"] = end_time.strftime("%H:%M")
+    st.session_state["minute_time_of_day"] = start_time.strftime("%H:%M")
     return True
 
 
+def parse_time_field(value, fallback):
+    if isinstance(value, time):
+        return value
+    if isinstance(value, str):
+        parts = value.strip().split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            hour = max(0, min(23, int(parts[0])))
+            minute = max(0, min(59, int(parts[1])))
+            return time(hour, minute)
+    return fallback
+
+
 def build_query_payload():
+    trajectory_vehicle_ids = [
+        str(vehicle_id).strip()
+        for vehicle_id in st.session_state.get("trajectory_vehicle_ids", [])
+        if str(vehicle_id).strip()
+    ]
+
     start_time = datetime.combine(
         st.session_state["query_date"],
-        time(int(st.session_state["start_hour"]), int(st.session_state["start_minute"])),
+        parse_time_field(st.session_state["start_time_of_day"], time(8, 0)),
     )
     end_time = datetime.combine(
         st.session_state["query_date"],
-        time(int(st.session_state["end_hour"]), int(st.session_state["end_minute"])),
+        parse_time_field(st.session_state["end_time_of_day"], time(10, 0)),
     )
     minute_time = datetime.combine(
         st.session_state["query_date"],
-        time(int(st.session_state["minute_hour"]), int(st.session_state["minute_minute"])),
+        parse_time_field(st.session_state["minute_time_of_day"], time(9, 30)),
     )
 
     return {
-        "vehicle_id": st.session_state["vehicle_id"].strip(),
+        "vehicle_id": trajectory_vehicle_ids[0] if trajectory_vehicle_ids else "",
+        "trajectory_vehicle_ids": trajectory_vehicle_ids,
         "start_time": start_time,
         "end_time": end_time,
         "minute_time": minute_time,
@@ -311,10 +360,15 @@ def build_query_payload():
 
 def validate_payload(payload):
     errors = []
-    vehicle_id = payload["vehicle_id"]
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
 
-    if vehicle_id and not vehicle_id.isdigit():
-        errors.append("车辆ID必须为数字。")
+    if len(trajectory_vehicle_ids) > 10:
+        errors.append("轨迹查询最多同时选择 10 辆车。")
+
+    for item in trajectory_vehicle_ids:
+        if item and not str(item).isdigit():
+            errors.append("轨迹查询车辆ID必须为数字。")
+            break
 
     if payload["start_time"] >= payload["end_time"]:
         errors.append("开始时间必须早于结束时间。")
@@ -328,34 +382,30 @@ def validate_payload(payload):
 def sidebar_form():
     st.sidebar.markdown("### 查询控制台")
     with st.sidebar.form("query_form", clear_on_submit=False):
-        st.text_input("车辆 ID", key="vehicle_id", placeholder="留空可用于分钟查询/OD查询")
         st.date_input("日期", key="query_date")
 
-        st.markdown("#### 轨迹时间")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("开始时间")
-            t1, t2 = st.columns(2)
-            with t1:
-                st.number_input("时", min_value=0, max_value=23, key="start_hour", step=1, format="%02d", label_visibility="collapsed")
-            with t2:
-                st.number_input("分", min_value=0, max_value=59, key="start_minute", step=1, format="%02d", label_visibility="collapsed")
-        with c2:
-            st.caption("结束时间")
-            t3, t4 = st.columns(2)
-            with t3:
-                st.number_input("时", min_value=0, max_value=23, key="end_hour", step=1, format="%02d", label_visibility="collapsed")
-            with t4:
-                st.number_input("分", min_value=0, max_value=59, key="end_minute", step=1, format="%02d", label_visibility="collapsed")
+        available_vehicle_ids = get_available_vehicle_ids()
+        current_trajectory_ids = [
+            str(vehicle_id).strip()
+            for vehicle_id in st.session_state.get("trajectory_vehicle_ids", [])
+            if str(vehicle_id).strip() in available_vehicle_ids
+        ]
+        if current_trajectory_ids != st.session_state.get("trajectory_vehicle_ids", []):
+            st.session_state["trajectory_vehicle_ids"] = current_trajectory_ids
 
-        st.markdown("#### 分钟查询时间")
-        m1, m2 = st.columns(2)
-        with m1:
-            st.number_input("分钟时", min_value=0, max_value=23, key="minute_hour", step=1, format="%02d", label_visibility="collapsed")
-        with m2:
-            st.number_input("分钟分", min_value=0, max_value=59, key="minute_minute", step=1, format="%02d", label_visibility="collapsed")
+        st.multiselect(
+            "车辆ID",
+            options=available_vehicle_ids,
+            key="trajectory_vehicle_ids",
+            help="最多同时支持10车查询",
+        )
 
-        st.slider("动画速度", 0.5, 5.0, key="time_scale", step=0.1)
+        st.markdown("#### 轨迹区间")
+        st.text_input("开始时间", key="start_time_of_day", placeholder="08:00")
+        st.text_input("结束时间", key="end_time_of_day", placeholder="10:00")
+
+        st.markdown("#### 分钟查询")
+        st.text_input("查询时间", key="minute_time_of_day", placeholder="09:30")
 
         st.markdown("#### ETA 预留坐标")
         c3, c4 = st.columns(2)
@@ -373,31 +423,9 @@ def sidebar_form():
         - 轨迹查询：读取车辆缓存，展示指定时间范围内的行驶轨迹
         - 分钟位置：读取分钟缓存，查看某一分钟的车辆分布
         - OD 点标注：展示上车点和下车点，并自动区分线路
-        - 动画轨迹：按时间顺序播放单车运动，并显示速度变化
+        - 动画轨迹：在动画页面中按时间顺序播放单车运动，并显示速度变化
         """
     )
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 车辆时间范围")
-    vehicle_id = st.session_state.get("vehicle_id", "").strip()
-    if vehicle_id and vehicle_id.isdigit():
-        time_range = get_vehicle_time_range(vehicle_id)
-        if time_range:
-            st.sidebar.markdown(
-                f"""
-                <div class="subtle-panel">
-                    <div style="font-size:0.82rem;color:#616161;margin-bottom:0.25rem;">缓存轨迹范围</div>
-                    <div style="font-size:0.98rem;font-weight:700;margin-bottom:0.2rem;">{time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')}</div>
-                    <div style="font-size:0.98rem;font-weight:700;margin-bottom:0.45rem;">{time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}</div>
-                    <div style="font-size:0.82rem;color:#616161;">轨迹点数: {time_range['total_points']:,}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.sidebar.caption("根据该范围调整轨迹起止时间，更容易命中缓存中的有效数据。")
-            if st.sidebar.button("使用建议时间范围", use_container_width=True):
-                if apply_vehicle_time_range(vehicle_id):
-                    st.rerun()
 
     st.sidebar.markdown("---")
     if st.sidebar.button("重置为默认值", use_container_width=True):
@@ -422,11 +450,23 @@ def render_header():
 
 def render_summary(payload):
     cols = st.columns(4)
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+    if trajectory_vehicle_ids:
+        if len(trajectory_vehicle_ids) == 1:
+            trajectory_vehicle_value = trajectory_vehicle_ids[0]
+        else:
+            preview_ids = "、".join(trajectory_vehicle_ids[:3])
+            trajectory_vehicle_value = f"{len(trajectory_vehicle_ids)}辆: {preview_ids}"
+            if len(trajectory_vehicle_ids) > 3:
+                trajectory_vehicle_value += " ..."
+    else:
+        trajectory_vehicle_value = "全部车辆"
+
     cards = [
-        ("车辆 ID", payload["vehicle_id"] or "全部车辆"),
-        ("轨迹时间", f"{payload['start_time'].strftime('%H:%M')} - {payload['end_time'].strftime('%H:%M')}"),
+        ("车辆ID", trajectory_vehicle_value),
+        ("轨迹区间", f"{payload['start_time'].strftime('%H:%M')} - {payload['end_time'].strftime('%H:%M')}"),
         ("分钟查询", payload["minute_time"].strftime("%H:%M")),
-        ("动画速度", f"{payload['time_scale']:.1f}x"),
+        ("参考坐标", f"{payload['ref_lat']:.4f}, {payload['ref_lng']:.4f}"),
     ]
     for col, (label, value) in zip(cols, cards):
         with col:
@@ -438,11 +478,8 @@ def render_summary(payload):
                 </div>
                 """,
                 unsafe_allow_html=True,
-            )
-    st.caption(
-        f"参考坐标: {payload['ref_lat']:.6f}, {payload['ref_lng']:.6f} | "
-        "轨迹读取车辆缓存，分钟读取分钟缓存，OD 标注读取完成后的 OD 表。"
     )
+    st.caption("轨迹读取车辆缓存，分钟读取分钟缓存，OD 标注读取完成后的 OD 表。")
 
 
 def render_html_map(html_path, height=700, loading_message="加载中..."):
@@ -455,31 +492,149 @@ def render_html_map(html_path, height=700, loading_message="加载中..."):
         st.error("地图生成失败，请检查数据缓存是否存在。")
 
 
+def render_vehicle_status_panel(trajectory_frames):
+    if not trajectory_frames:
+        return
+
+    st.markdown("#### 多车状态概览")
+    rows = []
+    for vehicle_id, df in trajectory_frames:
+        if df is None or len(df) == 0:
+            continue
+        points = len(df)
+        avg_speed = float(pd.to_numeric(df.get("speed", pd.Series(dtype=float)), errors="coerce").fillna(0.0).mean()) if "speed" in df.columns else 0.0
+        occupied_points = int((df["status"] == 1).sum()) if "status" in df.columns else 0
+        occupied_ratio = occupied_points / points if points else 0.0
+        current_status = "载客" if int(df.iloc[-1]["status"]) == 1 else "空载"
+        start_time = df.iloc[0]["time"].strftime("%H:%M:%S") if "time" in df.columns and pd.notna(df.iloc[0]["time"]) else "--"
+        end_time = df.iloc[-1]["time"].strftime("%H:%M:%S") if "time" in df.columns and pd.notna(df.iloc[-1]["time"]) else "--"
+        rows.append(
+            {
+                "vehicle_id": vehicle_id,
+                "points": points,
+                "avg_speed": avg_speed,
+                "occupied_ratio": occupied_ratio,
+                "current_status": current_status,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
+
+    if not rows:
+        return
+
+    card_css = dedent(
+        """
+        <style>
+        .multi-vehicle-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 10px;
+            margin: 0.5rem 0 0.75rem 0;
+        }
+        .multi-vehicle-card {
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 14px;
+            padding: 12px 14px;
+        }
+        .multi-vehicle-card .vehicle-id {
+            font-size: 0.95rem;
+            font-weight: 800;
+            color: #212121;
+            margin-bottom: 0.35rem;
+        }
+        .multi-vehicle-card .line {
+            font-size: 0.84rem;
+            color: #616161;
+            margin-bottom: 0.2rem;
+        }
+        .multi-vehicle-card .line strong {
+            color: #212121;
+        }
+        @media (max-width: 1200px) {
+            .multi-vehicle-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 768px) {
+            .multi-vehicle-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """
+    ).strip()
+    cards_html = '<div class="multi-vehicle-grid">'
+    for row in rows:
+        cards_html += dedent(
+            f"""
+            <div class="multi-vehicle-card">
+              <div class="vehicle-id">车辆 {row['vehicle_id']}</div>
+              <div class="line">轨迹点 <strong>{row['points']}</strong></div>
+              <div class="line">平均速度 <strong>{row['avg_speed']:.1f} km/h</strong></div>
+              <div class="line">载客率 <strong>{row['occupied_ratio'] * 100:.0f}%</strong></div>
+              <div class="line">终点状态 <strong>{row['current_status']}</strong></div>
+              <div class="line">时间 <strong>{row['start_time']} - {row['end_time']}</strong></div>
+            </div>
+            """
+        ).strip()
+    cards_html += "</div>"
+    st.markdown(card_css + "\n" + cards_html, unsafe_allow_html=True)
+
+
 def render_trajectory_view(payload):
     st.subheader("轨迹查询")
-    if not payload["vehicle_id"]:
-        st.info("请输入车辆 ID 后查看单车轨迹。")
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+    if not trajectory_vehicle_ids:
+        st.info("请选择至少一辆车后查看轨迹。")
         return
 
     with st.spinner("正在读取车辆缓存并生成轨迹地图..."):
-        df = cached_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"])
-        if df is None or len(df) == 0:
+        trajectory_frames = []
+        missing_vehicle_ids = []
+        for vehicle_id in trajectory_vehicle_ids[:10]:
+            df = cached_vehicle_trajectory(vehicle_id, payload["start_time"], payload["end_time"])
+            if df is None or len(df) == 0:
+                missing_vehicle_ids.append(vehicle_id)
+                continue
+            trajectory_frames.append((vehicle_id, df))
+
+        if missing_vehicle_ids:
+            st.warning("以下车辆在当前时间范围内没有可显示的轨迹数据: " + "、".join(missing_vehicle_ids))
+
+        if not trajectory_frames:
             st.warning("未找到符合条件的轨迹数据。")
             return
 
+        combined_df = pd.concat([df.assign(vehicle_id=vehicle_id) for vehicle_id, df in trajectory_frames], ignore_index=True)
         cols = st.columns(4)
         metrics = [
-            ("轨迹点", len(df)),
-            ("载客点", int((df["status"] == 1).sum())),
-            ("空载点", int((df["status"] == 0).sum())),
-            ("平均速度", f"{df['speed'].mean():.1f} km/h"),
+            ("车辆数", len(trajectory_frames)),
+            ("轨迹点", len(combined_df)),
+            ("载客点", int((combined_df["status"] == 1).sum())),
+            ("空载点", int((combined_df["status"] == 0).sum())),
         ]
         for col, (label, value) in zip(cols, metrics):
             with col:
                 st.metric(label, value)
 
-        st.caption("轨迹按状态自动着色：红色表示载客，蓝色表示空载。")
-        render_html_map(plot_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"]), height=700)
+        st.caption("轨迹颜色区分车辆，线型区分状态：实线表示载客，虚线表示空载。")
+        render_vehicle_status_panel(trajectory_frames)
+        if len(trajectory_frames) == 1:
+            render_html_map(
+                plot_vehicle_trajectory(trajectory_frames[0][0], payload["start_time"], payload["end_time"]),
+                height=700,
+            )
+        else:
+            render_html_map(
+                plot_vehicle_trajectories(
+                    [vehicle_id for vehicle_id, _ in trajectory_frames],
+                    payload["start_time"],
+                    payload["end_time"],
+                ),
+                height=700,
+            )
 
 
 def render_minute_view(payload):
@@ -489,29 +644,37 @@ def render_minute_view(payload):
         if df is None or len(df) == 0:
             st.warning("该分钟没有车辆数据。")
             return
+        st.caption("点击地图上的车辆点，可展开查看该车后续轨迹。")
 
-        df_view = df
-        if payload["vehicle_id"]:
-            vehicle_df = df[df["vehicle_id"] == str(payload["vehicle_id"])]
-            if len(vehicle_df) == 0:
-                st.warning(f"车辆 {payload['vehicle_id']} 在该分钟没有位置数据。")
-                time_range = get_vehicle_time_range(payload["vehicle_id"])
-                if time_range:
-                    st.caption(
-                        f"该车辆缓存轨迹时间范围为 {time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')} "
-                        f"至 {time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}，可尝试调整分钟查询时间。"
-                    )
-                return
-            df_view = vehicle_df
-            st.caption(f"当前仅显示车辆 {payload['vehicle_id']} 的分钟位置。")
+        display_df = df
+        selected_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+        if selected_vehicle_ids:
+            if len(selected_vehicle_ids) == 1:
+                display_df = df[df["vehicle_id"] == str(selected_vehicle_ids[0])]
+                if len(display_df) == 0:
+                    st.warning(f"车辆 {selected_vehicle_ids[0]} 在该分钟没有位置数据。")
+                    time_range = get_vehicle_time_range(selected_vehicle_ids[0])
+                    if time_range:
+                        st.caption(
+                            f"该车辆缓存轨迹时间范围为 {time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"至 {time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}，可尝试调整分钟查询。"
+                        )
+                    return
+                st.caption(f"当前仅显示车辆 {selected_vehicle_ids[0]} 的分钟位置。")
+            else:
+                display_df = df[df["vehicle_id"].isin(selected_vehicle_ids)]
+                if len(display_df) == 0:
+                    st.warning("所选车辆在该分钟没有位置数据。")
+                    return
+                st.caption(f"当前显示所选 {len(selected_vehicle_ids)} 辆车的分钟位置。")
         else:
             st.caption("当前显示所有车辆的分钟位置，系统会自动按上限抽样以提升流畅度。")
 
         cols = st.columns(3)
         minute_metrics = [
-            ("车辆总数", len(df)),
-            ("载客车辆", int((df["status"] == 1).sum())),
-            ("空载车辆", int((df["status"] == 0).sum())),
+            ("车辆总数", len(display_df)),
+            ("载客车辆", int((display_df["status"] == 1).sum())),
+            ("空载车辆", int((display_df["status"] == 0).sum())),
         ]
         for col, (label, value) in zip(cols, minute_metrics):
             with col:
@@ -520,7 +683,7 @@ def render_minute_view(payload):
         render_html_map(
             plot_minute_vehicles(
                 payload["minute_time"],
-                payload["vehicle_id"] if payload["vehicle_id"] else None,
+                vehicle_ids=selected_vehicle_ids if selected_vehicle_ids else None,
             ),
             height=700,
         )
@@ -529,11 +692,19 @@ def render_minute_view(payload):
 def render_od_view(payload):
     st.subheader("OD 上下车点")
     with st.spinner("正在读取 OD 表并生成上下车点地图..."):
-        df = cached_od_data(payload["start_time"], payload["end_time"], payload["vehicle_id"] or None)
+        selected_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+        if selected_vehicle_ids:
+            df = cached_od_data(payload["start_time"], payload["end_time"], None, tuple(selected_vehicle_ids))
+        else:
+            df = cached_od_data(payload["start_time"], payload["end_time"], None, None)
         if df is None or len(df) == 0:
-            if payload["vehicle_id"]:
-                st.warning(f"车辆 {payload['vehicle_id']} 在当前时间范围内没有 OD 记录。")
-                time_range = get_vehicle_time_range(payload["vehicle_id"])
+            if selected_vehicle_ids:
+                if len(selected_vehicle_ids) == 1:
+                    st.warning(f"车辆 {selected_vehicle_ids[0]} 在当前时间范围内没有 OD 记录。")
+                    time_range = get_vehicle_time_range(selected_vehicle_ids[0])
+                else:
+                    st.warning("所选车辆在当前时间范围内没有 OD 记录。")
+                    time_range = None
                 if time_range:
                     st.caption(
                         f"该车辆轨迹缓存范围为 {time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')} "
@@ -556,54 +727,96 @@ def render_od_view(payload):
 
         st.caption("绿色为上车点，红色为下车点。点较多时会自动聚类并抽样连线。")
         render_html_map(
-            plot_od_points(payload["start_time"], payload["end_time"], payload["vehicle_id"] or None),
+            plot_od_points(
+                payload["start_time"],
+                payload["end_time"],
+                None,
+                selected_vehicle_ids if selected_vehicle_ids else None,
+            ),
             height=700,
         )
 
 
 def render_animation_view(payload):
-    st.subheader("单车动画轨迹")
-    if not payload["vehicle_id"]:
-        st.info("请输入车辆 ID 后播放动画轨迹。")
+    animation_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+
+    if not animation_vehicle_ids:
+        st.subheader("动画轨迹")
+        st.info("请选择至少一辆车后播放动画轨迹。")
         return
 
+    st.subheader("多车动画轨迹" if len(animation_vehicle_ids) > 1 else "单车动画轨迹")
+
     with st.spinner("正在生成动画轨迹..."):
-        df = cached_vehicle_trajectory(payload["vehicle_id"], payload["start_time"], payload["end_time"])
-        if df is None or len(df) < 2:
+        animation_frames = []
+        missing_vehicle_ids = []
+        for vehicle_id in animation_vehicle_ids[:10]:
+            df = cached_vehicle_trajectory(vehicle_id, payload["start_time"], payload["end_time"])
+            if df is None or len(df) < 2:
+                missing_vehicle_ids.append(vehicle_id)
+                continue
+            animation_frames.append((vehicle_id, df))
+
+        if missing_vehicle_ids:
+            st.warning("以下车辆在当前时间范围内轨迹点不足，已跳过动画: " + "、".join(missing_vehicle_ids))
+
+        if not animation_frames:
             st.warning("轨迹点不足，无法生成动画。")
             return
 
+        combined_df = pd.concat([df.assign(vehicle_id=vehicle_id) for vehicle_id, df in animation_frames], ignore_index=True)
         st.caption("动画采用逐帧插值播放，并根据相邻轨迹点的时间差模拟速度变化。")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("轨迹点", len(df))
-        with c2:
-            st.metric("时间跨度", f"{(df.iloc[-1]['time'] - df.iloc[0]['time']).total_seconds() / 60:.0f} 分钟")
-        with c3:
-            st.metric("平均速度", f"{df['speed'].mean():.1f} km/h")
-
-        render_html_map(
-            plot_animated_trajectory(
-                payload["vehicle_id"],
-                payload["start_time"],
-                payload["end_time"],
-                payload["time_scale"],
-            ),
-            height=780,
-        )
+        if len(animation_frames) == 1:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("轨迹点", len(combined_df))
+            with c2:
+                st.metric("时间跨度", f"{(combined_df.iloc[-1]['time'] - combined_df.iloc[0]['time']).total_seconds() / 60:.0f} 分钟")
+            with c3:
+                st.metric("平均速度", f"{combined_df['speed'].mean():.1f} km/h")
+            render_html_map(
+                plot_animated_trajectory(
+                    animation_frames[0][0],
+                    payload["start_time"],
+                    payload["end_time"],
+                    payload["time_scale"],
+                ),
+                height=840,
+            )
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("车辆数", len(animation_frames))
+            with c2:
+                st.metric("轨迹点", len(combined_df))
+            with c3:
+                st.metric("平均速度", f"{combined_df['speed'].mean():.1f} km/h")
+            with c4:
+                st.metric("时间跨度", f"{(combined_df['time'].max() - combined_df['time'].min()).total_seconds() / 60:.0f} 分钟")
+            render_html_map(
+                plot_multi_vehicle_animated_trajectory(
+                    [vehicle_id for vehicle_id, _ in animation_frames],
+                    payload["start_time"],
+                    payload["end_time"],
+                    payload["time_scale"],
+                ),
+                height=940,
+            )
 
 
 def render_query_status(payload):
     """显示当前查询状态，帮助用户确认是否在正确范围内查询。"""
-    vehicle_id = payload["vehicle_id"]
-    if vehicle_id:
-        time_range = get_vehicle_time_range(vehicle_id)
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+    if len(trajectory_vehicle_ids) == 1:
+        time_range = get_vehicle_time_range(trajectory_vehicle_ids[0])
         if time_range:
             st.info(
-                f"当前车辆 {vehicle_id} 的缓存轨迹范围为 "
+                f"当前车辆 {trajectory_vehicle_ids[0]} 的缓存轨迹范围为 "
                 f"{time_range['min_time'].strftime('%Y-%m-%d %H:%M:%S')} 至 "
                 f"{time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}。"
             )
+    elif len(trajectory_vehicle_ids) > 1:
+        st.info(f"当前已选择 {len(trajectory_vehicle_ids)} 辆车进行轨迹并行展示。")
     else:
         st.caption("当前为全部车辆模式，结果将按时间范围查询并展示汇总预览。")
 
