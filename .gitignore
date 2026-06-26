@@ -10,3 +10,6 @@ __pycache__/
 *.json
 *.xlsx
 exports/
+findings.md
+progress.md
+task_plan.md
