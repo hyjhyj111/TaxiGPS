@@ -4,14 +4,26 @@
 import json
 import logging
 import os
+import pickle
 import sys
 from functools import lru_cache
 from datetime import datetime
 from math import atan2, cos, radians, sin, sqrt
+from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+
+try:
+    import networkx as nx
+except ImportError:
+    nx = None
+
+try:
+    import osmnx as ox
+except ImportError:
+    ox = None
 
 try:
     import folium
@@ -27,6 +39,16 @@ CONFIG = {
     "VEHICLE_CACHE_DIR": "cache/vehicles/",
     "MINUTE_CACHE_DIR": "cache/minutes/",
     "OD_TABLE_PATH": "data/processed/od_table.csv",
+    "ROAD_NETWORK_PATHS": [
+        "shenzhen_drive.pkl",
+        "data/shenzhen_drive.pkl",
+        "cache/shenzhen_drive.pkl",
+        "shenzhen_drive.graphml",
+        "data/shenzhen_drive.graphml",
+        "cache/shenzhen_drive.graphml",
+        "d:/shenzhen_drive.pkl",
+        "d:/shenzhen_drive.graphml",
+    ],
     "BOUNDARY_PATHS": [
         "data/深圳市.json",
         "data/shenzhen.json",
@@ -37,6 +59,9 @@ CONFIG = {
     "MAX_TRAJECTORY_POINTS": 1200,
     "MAX_VEHICLE_DISPLAY": 1200,
     "MAX_OD_POINTS": 1200,
+    "MAX_ROAD_CORRECTION_VEHICLES": 3,
+    "MAX_ROAD_CORRECTION_INPUT_POINTS": 220,
+    "MAX_CORRECTED_PATH_POINTS": 1600,
     "ANIMATION_MIN_DELAY_MS": 80,
     "ANIMATION_MAX_DELAY_MS": 2500,
     "ANIMATION_GAP_THRESHOLD_S": 1800,
@@ -288,7 +313,44 @@ def add_shenzhen_boundary(m):
 def add_map_layers(m, include_boundary=True):
     if include_boundary:
         add_shenzhen_boundary(m)
+    add_click_coordinate_picker(m)
     folium.LayerControl(collapsed=False).add_to(m)
+
+
+def add_click_coordinate_picker(m):
+    map_name = m.get_name()
+    picker_id = f"coord-picker-{map_name}"
+    picker_html = f"""
+    <div id="{picker_id}" style="position:fixed;left:16px;bottom:18px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:210px;">
+      <div style="font-size:12px;font-weight:700;margin-bottom:4px;">地图选点</div>
+      <div data-role="coord" style="font-size:12px;color:#475569;line-height:1.45;">点击地图显示经纬度</div>
+    </div>
+    """
+    picker_js = f"""
+    (function bindCoordinatePicker() {{
+        var map = window[{json.dumps(map_name)}];
+        var panel = document.getElementById({json.dumps(picker_id)});
+        if (!map || !panel) {{
+            window.setTimeout(bindCoordinatePicker, 50);
+            return;
+        }}
+        var coordNode = panel.querySelector('[data-role="coord"]');
+        var marker = null;
+        map.on('click', function(e) {{
+            var lat = e.latlng.lat;
+            var lng = e.latlng.lng;
+            coordNode.innerHTML = '纬度: <strong>' + lat.toFixed(6) + '</strong><br>经度: <strong>' + lng.toFixed(6) + '</strong>';
+            if (!marker) {{
+                marker = L.marker(e.latlng, {{title: '地图选点'}}).addTo(map);
+            }} else {{
+                marker.setLatLng(e.latlng);
+            }}
+            marker.bindPopup('纬度: ' + lat.toFixed(6) + '<br>经度: ' + lng.toFixed(6)).openPopup();
+        }});
+    }})();
+    """
+    m.get_root().html.add_child(folium.Element(picker_html))
+    m.get_root().script.add_child(folium.Element(picker_js))
 
 
 def build_map(df=None, zoom=None):
@@ -337,6 +399,249 @@ def load_vehicle_trajectory(vehicle_id, start_time=None, end_time=None, log_resu
             len(df),
         )
     return df
+
+
+def _road_network_candidates():
+    env_path = os.environ.get("TAXIGPS_ROAD_NETWORK_PATH")
+    paths = [env_path] if env_path else []
+    paths.extend(CONFIG["ROAD_NETWORK_PATHS"])
+    cleaned = []
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.expanduser(str(path))
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned
+
+
+def find_road_network_path():
+    for path in _road_network_candidates():
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def road_network_status():
+    path = find_road_network_path()
+    return {
+        "available": bool(path),
+        "path": path,
+        "candidates": _road_network_candidates(),
+        "osmnx_available": ox is not None,
+        "networkx_available": nx is not None,
+    }
+
+
+@lru_cache(maxsize=2)
+def _load_road_network_cached(path, version_key):
+    del version_key
+    start = perf_counter()
+    if path.lower().endswith(".pkl"):
+        with open(path, "rb") as f:
+            graph = pickle.load(f)
+        method = "pkl"
+    elif path.lower().endswith(".graphml"):
+        if ox is None:
+            raise RuntimeError("加载 graphml 路网需要安装 osmnx。")
+        graph = ox.load_graphml(path)
+        method = "graphml"
+    else:
+        raise ValueError(f"不支持的路网文件格式: {path}")
+
+    load_seconds = perf_counter() - start
+    node_count = graph.number_of_nodes() if hasattr(graph, "number_of_nodes") else 0
+    edge_count = graph.number_of_edges() if hasattr(graph, "number_of_edges") else 0
+    log.info(
+        "路网加载完成: path=%s, method=%s, nodes=%s, edges=%s, seconds=%.2f",
+        path,
+        method,
+        node_count,
+        edge_count,
+        load_seconds,
+    )
+    return graph, {
+        "path": path,
+        "method": method,
+        "load_seconds": load_seconds,
+        "node_count": node_count,
+        "edge_count": edge_count,
+    }
+
+
+def load_road_network(path=None):
+    network_path = path or find_road_network_path()
+    if not network_path:
+        return None, {
+            "available": False,
+            "error": "未找到 shenzhen_drive.pkl 或 shenzhen_drive.graphml。",
+            "candidates": _road_network_candidates(),
+        }
+    return _load_road_network_cached(network_path, _file_version_key(network_path))
+
+
+def _nearest_node_bruteforce(graph, lng, lat):
+    best_node = None
+    best_dist = float("inf")
+    for node, attrs in graph.nodes(data=True):
+        node_lng = attrs.get("x", attrs.get("lon", attrs.get("lng")))
+        node_lat = attrs.get("y", attrs.get("lat"))
+        if node_lng is None or node_lat is None:
+            continue
+        dist = (float(node_lng) - float(lng)) ** 2 + (float(node_lat) - float(lat)) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best_node = node
+    if best_node is None:
+        raise ValueError("路网节点缺少 x/y 或 lon/lat 坐标，无法执行最近邻匹配。")
+    return best_node
+
+
+def nearest_road_node(graph, lng, lat):
+    if ox is not None:
+        try:
+            return ox.distance.nearest_nodes(graph, float(lng), float(lat))
+        except Exception:
+            log.exception("OSMnx 最近邻匹配失败，改用节点遍历匹配。")
+    return _nearest_node_bruteforce(graph, lng, lat)
+
+
+def _node_lat_lng(graph, node):
+    attrs = graph.nodes[node]
+    lng = attrs.get("x", attrs.get("lon", attrs.get("lng")))
+    lat = attrs.get("y", attrs.get("lat"))
+    if lng is None or lat is None:
+        return None
+    return [float(lat), float(lng)]
+
+
+def _shortest_path_nodes(graph, source, target, undirected_graph=None):
+    if source == target:
+        return [source], "same_node"
+    if nx is None:
+        raise RuntimeError("路网最短路径需要安装 networkx。")
+    try:
+        return nx.shortest_path(graph, source, target, weight="length"), "directed"
+    except Exception as exc:
+        if undirected_graph is None:
+            raise exc
+        return nx.shortest_path(undirected_graph, source, target, weight="length"), "undirected"
+
+
+def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
+    if df is None or len(df) < 2:
+        return {
+            "points": [],
+            "matched_nodes": [],
+            "meta": {
+                "success": False,
+                "error": "轨迹点不足，无法校正。",
+            },
+        }
+
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return {
+            "points": [],
+            "matched_nodes": [],
+            "meta": {
+                "success": False,
+                "error": network_meta.get("error", "路网未加载。"),
+                "network": network_meta,
+            },
+        }
+
+    sample_df = resample_trajectory(df, CONFIG["MAX_ROAD_CORRECTION_INPUT_POINTS"])
+    matched_nodes = []
+    nearest_failures = 0
+    for _, row in sample_df.iterrows():
+        try:
+            matched_nodes.append(nearest_road_node(graph, row["long"], row["lati"]))
+        except Exception:
+            nearest_failures += 1
+            log.exception("GPS 点最近邻匹配失败: lng=%s, lat=%s", row.get("long"), row.get("lati"))
+
+    if len(matched_nodes) < 2:
+        return {
+            "points": [],
+            "matched_nodes": matched_nodes,
+            "meta": {
+                "success": False,
+                "error": "有效匹配节点不足，无法拼接校正轨迹。",
+                "nearest_failures": nearest_failures,
+                "network": network_meta,
+            },
+        }
+
+    undirected_graph = None
+    corrected_points = []
+    path_failures = 0
+    undirected_segments = 0
+    same_node_segments = 0
+
+    for idx in range(1, len(matched_nodes)):
+        source = matched_nodes[idx - 1]
+        target = matched_nodes[idx]
+        if undirected_graph is None and source != target and hasattr(graph, "is_directed") and graph.is_directed():
+            try:
+                undirected_graph = graph.to_undirected(as_view=True)
+            except TypeError:
+                undirected_graph = graph.to_undirected()
+        try:
+            path_nodes, mode = _shortest_path_nodes(graph, source, target, undirected_graph=undirected_graph)
+            if mode == "undirected":
+                undirected_segments += 1
+            elif mode == "same_node":
+                same_node_segments += 1
+        except Exception:
+            path_failures += 1
+            log.exception("路网最短路径失败: source=%s, target=%s", source, target)
+            fallback = _node_lat_lng(graph, source)
+            if fallback:
+                if not corrected_points or corrected_points[-1] != fallback:
+                    corrected_points.append(fallback)
+            continue
+
+        for node in path_nodes:
+            point = _node_lat_lng(graph, node)
+            if not point:
+                continue
+            if corrected_points and corrected_points[-1] == point:
+                continue
+            corrected_points.append(point)
+
+    if len(corrected_points) > CONFIG["MAX_CORRECTED_PATH_POINTS"]:
+        idx = np.linspace(0, len(corrected_points) - 1, num=CONFIG["MAX_CORRECTED_PATH_POINTS"], dtype=int)
+        corrected_points = [corrected_points[i] for i in idx]
+
+    success = len(corrected_points) >= 2
+    meta = {
+        "success": success,
+        "raw_points": len(df),
+        "sampled_points": len(sample_df),
+        "matched_nodes": len(matched_nodes),
+        "corrected_points": len(corrected_points),
+        "nearest_failures": nearest_failures,
+        "path_failures": path_failures,
+        "undirected_segments": undirected_segments,
+        "same_node_segments": same_node_segments,
+        "network": network_meta,
+    }
+    if not success:
+        meta["error"] = "最短路径拼接后没有足够点位可显示。"
+    log.info(
+        "路网校正完成: raw=%s, sampled=%s, matched=%s, corrected=%s, nearest_failures=%s, path_failures=%s, undirected_segments=%s",
+        meta["raw_points"],
+        meta["sampled_points"],
+        meta["matched_nodes"],
+        meta["corrected_points"],
+        nearest_failures,
+        path_failures,
+        undirected_segments,
+    )
+    return {"points": corrected_points, "matched_nodes": matched_nodes, "meta": meta}
 
 
 def _trajectory_segment_rows(df):
@@ -1284,6 +1589,190 @@ def plot_vehicle_trajectories(vehicle_ids, start_time=None, end_time=None, save_
     m.save(output_path)
     log.info("多车辆轨迹地图已保存至: %s", output_path)
     return output_path
+
+
+def plot_road_corrected_trajectories(vehicle_ids, start_time=None, end_time=None, enable_correction=True, save_path=None):
+    cleaned_vehicle_ids = []
+    for vehicle_id in vehicle_ids or []:
+        vehicle_id = str(vehicle_id).strip()
+        if vehicle_id and vehicle_id not in cleaned_vehicle_ids:
+            cleaned_vehicle_ids.append(vehicle_id)
+    cleaned_vehicle_ids = cleaned_vehicle_ids[: CONFIG["MAX_ROAD_CORRECTION_VEHICLES"]]
+
+    log.info(
+        "生成路网校正轨迹: vehicle_ids=%s, start_time=%s, end_time=%s, enable_correction=%s",
+        cleaned_vehicle_ids,
+        start_time,
+        end_time,
+        enable_correction,
+    )
+
+    if not cleaned_vehicle_ids:
+        return None, {"success": False, "error": "未提供车辆ID。"}
+
+    vehicle_entries = []
+    loaded_frames = []
+    per_vehicle_limit = max(80, min(320, CONFIG["MAX_TRAJECTORY_POINTS"] // max(1, len(cleaned_vehicle_ids))))
+    for index, vehicle_id in enumerate(cleaned_vehicle_ids):
+        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+        if df is None or len(df) == 0:
+            continue
+        df = resample_trajectory(df, per_vehicle_limit)
+        color = _trajectory_color(index)
+        vehicle_entries.append({"vehicle_id": vehicle_id, "df": df, "color": color})
+        loaded_frames.append(df.assign(vehicle_id=vehicle_id))
+
+    if not vehicle_entries:
+        return None, {"success": False, "error": "所选车辆在当前时间范围内没有轨迹数据。"}
+
+    combined_df = pd.concat(loaded_frames, ignore_index=True)
+    m = build_map(combined_df)
+    graph = None
+    network_meta = {"available": False}
+    correction_available = False
+    if enable_correction:
+        graph, network_meta = load_road_network()
+        correction_available = graph is not None
+
+    corrections = []
+    for entry in vehicle_entries:
+        vehicle_id = entry["vehicle_id"]
+        df = entry["df"]
+        color = entry["color"]
+
+        raw_group = folium.FeatureGroup(name=f"车辆 {vehicle_id} 原始轨迹", show=True)
+        raw_group.add_to(m)
+        for segment in _trajectory_segment_dfs(df):
+            segment_df = segment["df"]
+            occupied = segment["status"] == 1
+            folium.PolyLine(
+                [[row["lati"], row["long"]] for _, row in segment_df.iterrows()],
+                color=color,
+                weight=3 if occupied else 2,
+                opacity=0.36,
+                dash_array=None if occupied else "6,6",
+                tooltip=f"车辆 {vehicle_id} 原始{'载客' if occupied else '空载'}轨迹",
+            ).add_to(raw_group)
+        _add_vehicle_markers(raw_group, df, vehicle_id, color)
+        _add_vehicle_mid_label(raw_group, df, vehicle_id, color)
+
+        if not enable_correction:
+            corrections.append(
+                {
+                    "vehicle_id": vehicle_id,
+                    "success": False,
+                    "raw_points": len(df),
+                    "corrected_points": 0,
+                    "path_failures": 0,
+                    "nearest_failures": 0,
+                    "message": "未启用路网校正。",
+                }
+            )
+            continue
+
+        if not correction_available:
+            corrections.append(
+                {
+                    "vehicle_id": vehicle_id,
+                    "success": False,
+                    "raw_points": len(df),
+                    "corrected_points": 0,
+                    "path_failures": 0,
+                    "nearest_failures": 0,
+                    "message": network_meta.get("error", "路网未加载。"),
+                }
+            )
+            continue
+
+        result = correct_trajectory_with_road_network(df, graph=graph, network_meta=network_meta)
+        meta = result["meta"]
+        corrected_points = result["points"]
+        corrections.append(
+            {
+                "vehicle_id": vehicle_id,
+                "success": bool(meta.get("success")),
+                "raw_points": meta.get("raw_points", len(df)),
+                "sampled_points": meta.get("sampled_points", 0),
+                "corrected_points": meta.get("corrected_points", len(corrected_points)),
+                "matched_nodes": meta.get("matched_nodes", 0),
+                "path_failures": meta.get("path_failures", 0),
+                "nearest_failures": meta.get("nearest_failures", 0),
+                "undirected_segments": meta.get("undirected_segments", 0),
+                "message": meta.get("error", "校正完成。"),
+            }
+        )
+        if len(corrected_points) >= 2:
+            corrected_group = folium.FeatureGroup(name=f"车辆 {vehicle_id} 路网校正", show=True)
+            corrected_group.add_to(m)
+            folium.PolyLine(
+                corrected_points,
+                color=color,
+                weight=6,
+                opacity=0.9,
+                tooltip=f"车辆 {vehicle_id} 路网校正轨迹",
+            ).add_to(corrected_group)
+            folium.PolyLine(
+                corrected_points,
+                color="#ffffff",
+                weight=2,
+                opacity=0.72,
+                tooltip=f"车辆 {vehicle_id} 路网校正轨迹",
+            ).add_to(corrected_group)
+
+    legend_rows = "".join(
+        f"""
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+          <span style="width:26px;height:0;border-top:3px solid {entry['color']};opacity:.36;"></span>
+          <span style="font-size:12px;color:#334155;">车辆 {entry['vehicle_id']} 原始轨迹</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <span style="width:26px;height:0;border-top:6px solid {entry['color']};"></span>
+          <span style="font-size:12px;color:#334155;">车辆 {entry['vehicle_id']} 校正轨迹</span>
+        </div>
+        """
+        for entry in vehicle_entries
+    )
+    network_label = network_meta.get("path") or "未加载"
+    legend_html = f"""
+    <div style="position:fixed;right:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.35);border-radius:12px;padding:12px 14px;box-shadow:0 12px 32px rgba(15,23,42,0.12);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:190px;max-width:320px;">
+      <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:6px;">路网校正图例</div>
+      <div style="font-size:12px;color:#64748b;line-height:1.5;margin-bottom:8px;">淡线为原始 GPS 轨迹，粗线为道路节点最短路拼接结果。点击地图可查看经纬度。</div>
+      {legend_rows}
+      <div style="font-size:11px;color:#64748b;line-height:1.45;border-top:1px solid rgba(148,163,184,0.25);padding-top:8px;">路网: {network_label}</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    add_map_layers(m)
+
+    start_str = format_time_tag(start_time)
+    end_str = format_time_tag(end_time)
+    vehicle_tag = "-".join(cleaned_vehicle_ids[:3])
+    output_path = save_path or os.path.join(
+        CONFIG["OUTPUT_MAP_DIR"],
+        f"road_corrected_{vehicle_tag}_{start_str}_{end_str}.html",
+    )
+    ensure_parent_dir(output_path)
+    m.save(output_path)
+
+    successful = sum(1 for item in corrections if item["success"])
+    info = {
+        "success": successful > 0 if enable_correction else True,
+        "enabled": enable_correction,
+        "vehicles": len(vehicle_entries),
+        "successful_corrections": successful,
+        "corrections": corrections,
+        "network": network_meta,
+        "output_path": output_path,
+    }
+    log.info(
+        "路网校正地图已保存: output=%s, vehicles=%s, successful=%s, network=%s",
+        output_path,
+        len(vehicle_entries),
+        successful,
+        network_label,
+    )
+    return output_path, info
 
 
 def load_minute_data(target_time):

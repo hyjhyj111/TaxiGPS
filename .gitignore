@@ -1,6 +1,10 @@
 .DS_Store
+# Python bytecode and interpreter caches
 __pycache__/
+**/__pycache__/
 *.pyc
+*.py[cod]
+*$py.class
 *.csv
 *.xlsx
 *.log
@@ -9,6 +13,8 @@ __pycache__/
 *.html
 *.json
 *.xlsx
+*.graphml
+*.pkl
 exports/
 findings.md
 progress.md

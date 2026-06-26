@@ -25,6 +25,13 @@
 - 支持播放速度调节
 - 轨迹按时间顺序平滑播放
 
+### 路网校正与地图选点
+- 支持加载深圳道路网络 `shenzhen_drive.pkl` 或 `shenzhen_drive.graphml`
+- 支持将 GPS 点匹配到最近道路节点，并用最短路径拼接校正轨迹
+- 支持原始轨迹与路网校正轨迹同图对比
+- 支持在地图上点击选点并显示经纬度
+- 路网校正示例默认限制为 1-3 辆车和短时间窗口，避免一次处理全量车辆
+
 ### 热力图与统计分析
 - 支持分钟缓存车辆位置静态热力图
 - 支持 OD 上车点静态热力图
@@ -59,6 +66,7 @@
 - Python `3.13+`
 - 已准备车辆缓存、分钟缓存和 OD 结果表
 - 已安装 `streamlit`、`folium`、`pandas`、`numpy`、`scikit-learn`、`altair`
+- 如需路网校正，需额外安装 `networkx`；如使用 `.graphml` 路网文件，还需安装 `osmnx`
 
 ## 项目结构
 
@@ -98,7 +106,7 @@ TaxiGPS/
 ## 安装依赖
 
 ```bash
-pip install streamlit folium pandas numpy scikit-learn altair
+pip install streamlit folium pandas numpy scikit-learn altair networkx osmnx
 ```
 
 ## 启动方式
@@ -119,6 +127,8 @@ python3 -m streamlit run src/streamlit_app.py
 4. 在“热力图与统计分析”中可切换静态热力图、动态热力图、订单统计、车辆运营、上车点聚类。
 5. 当热力图数据源为“分钟缓存车辆位置”时，系统固定按全部车辆统计。
 6. 当热力图数据源为“OD 上车点”时，系统按当前车辆筛选执行。
+7. 在“轨迹查询”中可打开“启用路网校正”，对所选前 1-3 辆车展示原始轨迹与校正轨迹。
+8. 地图支持点击选点，左下角面板会显示点击位置的经纬度。
 
 ## 数据准备
 
@@ -137,6 +147,7 @@ python3 -m streamlit run src/streamlit_app.py
 2. 运行 `clean_od_extraction.py` 提取 OD 上下车点。
 3. 首次启动系统时自动构建车辆缓存与分钟缓存。
 4. 将深圳边界文件放入 `data/深圳市.json`。
+5. 如需路网校正，将 `shenzhen_drive.pkl` 优先放入项目根目录、`data/` 或 `cache/`；也可使用 `TAXIGPS_ROAD_NETWORK_PATH` 指定自定义路径。
 
 ## 注意事项
 
@@ -144,6 +155,7 @@ python3 -m streamlit run src/streamlit_app.py
 - 统计导出目录为 `exports/heatmap_stats/`
 - 分钟热力图和静态热力图都带有边界过滤与漂移过滤
 - 动态热力图首次加载后可通过底部时间轴直接拖动查看任意时间片
+- 路网校正优先读取 pkl 文件；`nearest_nodes` 使用经度、纬度顺序，最短路径失败会被记录并跳过对应片段
 
 ## 更新记录
 

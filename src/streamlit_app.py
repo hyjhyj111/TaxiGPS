@@ -42,8 +42,10 @@ from map_plotter import (  # noqa: E402
     plot_multi_vehicle_animated_trajectory,
     plot_minute_vehicles,
     plot_od_points,
+    plot_road_corrected_trajectories,
     plot_vehicle_trajectories,
     plot_vehicle_trajectory,
+    road_network_status,
 )
 
 
@@ -87,6 +89,7 @@ DEFAULTS = {
     "order_stats_request": None,
     "operation_stats_request": None,
     "last_active_view": "轨迹查询",
+    "road_correction_enabled": False,
 }
 
 
@@ -715,6 +718,25 @@ def render_trajectory_view(payload):
         st.info("请选择至少一辆车后查看轨迹。")
         return
 
+    control_cols = st.columns([1, 2])
+    with control_cols[0]:
+        enable_road_correction = st.checkbox(
+            "启用路网校正",
+            key="road_correction_enabled",
+            help="将 GPS 点吸附到深圳路网节点，并用最短路径拼接校正轨迹。建议一次选择 1-3 辆车和较短时间窗口。",
+        )
+    with control_cols[1]:
+        status = road_network_status()
+        if enable_road_correction and status["available"]:
+            st.caption(f"路网文件: {status['path']}")
+        elif enable_road_correction:
+            st.warning("未找到路网文件。请将 shenzhen_drive.pkl 或 shenzhen_drive.graphml 放到项目根目录、data/ 或 cache/，或设置 TAXIGPS_ROAD_NETWORK_PATH。")
+        else:
+            st.caption("点击生成的地图可显示经纬度；打开路网校正后会同时展示原始轨迹与道路校正轨迹。")
+
+    if enable_road_correction and len(trajectory_vehicle_ids) > CONFIG["MAX_ROAD_CORRECTION_VEHICLES"]:
+        st.warning(f"路网校正示例将仅处理前 {CONFIG['MAX_ROAD_CORRECTION_VEHICLES']} 辆车，避免一次性处理全量车辆。")
+
     with st.spinner("正在读取车辆缓存并生成轨迹地图..."):
         trajectory_frames = []
         missing_vehicle_ids = []
@@ -746,7 +768,45 @@ def render_trajectory_view(payload):
 
         st.caption("轨迹颜色区分车辆，线型区分状态：实线表示载客，虚线表示空载。")
         render_vehicle_status_panel(trajectory_frames)
-        if len(trajectory_frames) == 1:
+        if enable_road_correction:
+            html_path, info = plot_road_corrected_trajectories(
+                [vehicle_id for vehicle_id, _ in trajectory_frames],
+                payload["start_time"],
+                payload["end_time"],
+                enable_correction=True,
+            )
+            network_meta = info.get("network", {}) if info else {}
+            if network_meta.get("path"):
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("路网节点", network_meta.get("node_count", 0))
+                with c2:
+                    st.metric("路网边", network_meta.get("edge_count", 0))
+                with c3:
+                    st.metric("校正成功车辆", info.get("successful_corrections", 0))
+                with c4:
+                    st.metric("加载耗时", f"{network_meta.get('load_seconds', 0):.2f}s")
+            if info and info.get("corrections"):
+                correction_df = pd.DataFrame(info["corrections"])
+                display_cols = [
+                    col
+                    for col in [
+                        "vehicle_id",
+                        "success",
+                        "raw_points",
+                        "sampled_points",
+                        "matched_nodes",
+                        "corrected_points",
+                        "nearest_failures",
+                        "path_failures",
+                        "undirected_segments",
+                        "message",
+                    ]
+                    if col in correction_df.columns
+                ]
+                st.dataframe(correction_df[display_cols], use_container_width=True, hide_index=True)
+            render_html_map(html_path, height=760)
+        elif len(trajectory_frames) == 1:
             render_html_map(
                 plot_vehicle_trajectory(trajectory_frames[0][0], payload["start_time"], payload["end_time"]),
                 height=700,
@@ -1389,7 +1449,7 @@ def main():
             st.session_state["operation_stats_request"] = None
             st.success("查询条件已更新。")
 
-        active_payload = st.session_state.get("last_query", payload)
+        active_payload = st.session_state.get("last_query") or payload
         render_summary(active_payload)
         render_query_status(active_payload)
 
