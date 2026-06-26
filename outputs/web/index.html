@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Taxi GPS 数据分析与可视化系统</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="assets/app.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">TG</div>
+        <div>
+          <strong>Taxi GPS</strong>
+          <span>实训 V 系统</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-page="overview"><i data-lucide="layout-dashboard"></i><span>总览</span></button>
+        <button class="nav-item" data-page="cleaning"><i data-lucide="filter"></i><span>数据清洗</span></button>
+        <button class="nav-item" data-page="od"><i data-lucide="route"></i><span>OD 与缓存</span></button>
+        <button class="nav-item" data-page="trajectory"><i data-lucide="navigation"></i><span>轨迹查询</span></button>
+        <button class="nav-item" data-page="minute"><i data-lucide="clock-3"></i><span>分钟位置</span></button>
+        <button class="nav-item" data-page="heatmap"><i data-lucide="flame"></i><span>热点热力</span></button>
+        <button class="nav-item" data-page="stats"><i data-lucide="bar-chart-3"></i><span>统计分析</span></button>
+        <button class="nav-item" data-page="network"><i data-lucide="map"></i><span>路网 ETA</span></button>
+        <button class="nav-item" data-page="report"><i data-lucide="file-text"></i><span>验收材料</span></button>
+      </nav>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">总览</h1>
+          <p id="pageSub">清洗、订单、热点、轨迹与 ETA 一体化工作台</p>
+        </div>
+        <div class="toolbar">
+          <label>车辆<select id="vehicleSelect"></select></label>
+          <label>时间片<select id="minuteSelect"></select></label>
+          <button id="playBtn" class="icon-btn" title="播放轨迹"><i data-lucide="play"></i></button>
+        </div>
+      </header>
+      <section id="overview" class="page active">
+        <div class="metrics" id="metrics"></div>
+        <div class="split">
+          <section class="map-panel"><div id="map"></div></section>
+          <section class="table-panel">
+            <h2>最近 OD 订单</h2>
+            <div id="odTable"></div>
+          </section>
+        </div>
+      </section>
+      <section id="cleaning" class="page">
+        <div class="metrics" id="cleaningMetrics"></div>
+        <section class="wide-panel">
+          <h2>清洗口径</h2>
+          <div class="timeline">
+            <span>字段统一</span><span>时间补全</span><span>重复处理</span><span>异常状态剔除</span><span>深圳范围过滤</span>
+          </div>
+        </section>
+      </section>
+      <section id="od" class="page">
+        <div class="split">
+          <section class="chart-panel"><canvas id="distanceChart"></canvas></section>
+          <section class="table-panel"><h2>OD 缓存样例</h2><div id="odCacheTable"></div></section>
+        </div>
+      </section>
+      <section id="trajectory" class="page">
+        <div class="split">
+          <section class="map-panel"><div id="trackMap"></div></section>
+          <section class="table-panel"><h2>轨迹点</h2><div id="trackTable"></div></section>
+        </div>
+      </section>
+      <section id="minute" class="page">
+        <div class="split">
+          <section class="map-panel"><div id="minuteMap"></div></section>
+          <section class="table-panel"><h2>分钟位置</h2><div id="minuteTable"></div></section>
+        </div>
+      </section>
+      <section id="heatmap" class="page">
+        <div class="split">
+          <section class="map-panel"><div id="hotspotMap"></div></section>
+          <section class="table-panel"><h2>DBSCAN 热点</h2><div id="hotspotTable"></div></section>
+        </div>
+      </section>
+      <section id="stats" class="page">
+        <div class="charts-grid">
+          <section class="chart-panel"><canvas id="hourlyChart"></canvas></section>
+          <section class="chart-panel"><canvas id="fleetChart"></canvas></section>
+        </div>
+        <section class="wide-panel"><h2>车辆运营排行</h2><div id="fleetTable"></div></section>
+      </section>
+      <section id="network" class="page">
+        <div class="split">
+          <section class="map-panel"><div id="etaMap"></div></section>
+          <section class="table-panel"><h2>ETA 样例</h2><div id="etaBox"></div></section>
+        </div>
+      </section>
+      <section id="report" class="page">
+        <div class="report-grid">
+          <section class="wide-panel"><h2>交付物</h2><div id="deliverables"></div></section>
+          <section class="wide-panel"><h2>验收命令</h2><pre>.venv/bin/python run_project.py pipeline
+.venv/bin/python run_project.py webapp --serve</pre></section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="assets/app.js"></script>
+</body>
+</html>
