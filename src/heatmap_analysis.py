@@ -7,6 +7,7 @@ from datetime import datetime
 from functools import lru_cache
 import hashlib
 import json
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -165,6 +166,66 @@ def _normalize_display_bounds(df, lat_col="lat", lng_col="lng"):
         df[lat_col].between(lat_min, lat_max)
         & df[lng_col].between(lng_min, lng_max)
     ].copy()
+
+
+@lru_cache(maxsize=1)
+def _load_shenzhen_boundary_shapes():
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    from matplotlib.path import Path
+
+    for path in CONFIG["BOUNDARY_PATHS"]:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            geojson = json.load(f)
+
+        features = geojson.get("features", [])
+        polygons = []
+        outer_rings = []
+        for feature in features:
+            geometry = feature.get("geometry", {})
+            geom_type = geometry.get("type")
+            coords = geometry.get("coordinates", [])
+            if geom_type == "Polygon":
+                coords = [coords]
+            if geom_type not in {"Polygon", "MultiPolygon"}:
+                continue
+            for polygon in coords:
+                if not polygon:
+                    continue
+                exterior = polygon[0]
+                holes = polygon[1:] if len(polygon) > 1 else []
+                outer_rings.append([[float(lat), float(lng)] for lng, lat in exterior])
+                polygons.append(
+                    {
+                        "exterior": Path(np.asarray(exterior, dtype=float)),
+                        "holes": [Path(np.asarray(hole, dtype=float)) for hole in holes if hole],
+                    }
+                )
+        if polygons:
+            return {"polygons": polygons, "outer_rings": outer_rings}
+    return {"polygons": [], "outer_rings": []}
+
+
+def _filter_points_to_shenzhen_boundary(df, lat_col="lat", lng_col="lng"):
+    if df is None or len(df) == 0:
+        return df, 0
+
+    boundary = _load_shenzhen_boundary_shapes()
+    polygons = boundary.get("polygons", [])
+    if not polygons:
+        return df.copy(), 0
+
+    points = df[[lng_col, lat_col]].to_numpy(dtype=float)
+    mask = np.zeros(len(df), dtype=bool)
+    for polygon in polygons:
+        current = polygon["exterior"].contains_points(points, radius=-1e-10)
+        for hole in polygon["holes"]:
+            current &= ~hole.contains_points(points, radius=1e-10)
+        mask |= current
+
+    filtered = df.loc[mask].copy()
+    return filtered, int(len(df) - len(filtered))
 
 
 def _is_minute_source(source_type):
@@ -1013,6 +1074,9 @@ def build_static_heatmap(
 
     heat_df = _normalize_display_bounds(heat_df, lat_col="lat", lng_col="lng")
     std_df = _normalize_display_bounds(std_df, lat_col="lat", lng_col="lng") if std_df is not None and len(std_df) else std_df
+    heat_df, boundary_removed = _filter_points_to_shenzhen_boundary(heat_df, lat_col="lat", lng_col="lng")
+    if len(cluster_df):
+        cluster_df, _ = _filter_points_to_shenzhen_boundary(cluster_df, lat_col="center_lat", lng_col="center_lng")
     if heat_df is None or len(heat_df) == 0:
         return None, meta
 
@@ -1065,13 +1129,15 @@ def build_static_heatmap(
         {
             "output_path": output_path,
             "input_points": int(meta.get("filter_stats", {}).get("output_points", len(std_df))),
-            "heat_points": int(len(points_df)),
+            "heat_points": int(len(heat_df)),
             "cluster_count": int(len(cluster_df)),
             "noise_count": int(len(noise_df)),
             "threshold_cap": cap_value,
             "cluster_heat_value_definition": "簇内空间聚合点权重之和；分钟热力值表示累计车辆出现次数，OD 热力值表示累计上车订单数。",
         }
     )
+    meta.setdefault("filter_stats", {})
+    meta["filter_stats"]["boundary_polygon_removed"] = int(boundary_removed)
     log.info(
         "静态热力图已生成: source=%s, cluster=%s, eps_km=%.3f, min_samples=%s, threshold_q=%.2f, output=%s",
         meta["source_label"],
