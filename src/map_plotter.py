@@ -62,6 +62,11 @@ CONFIG = {
     "MAX_ROAD_CORRECTION_VEHICLES": 3,
     "MAX_ROAD_CORRECTION_INPUT_POINTS": 220,
     "MAX_CORRECTED_PATH_POINTS": 1600,
+    "MAX_CONGESTION_VEHICLES": 8,
+    "MAX_CONGESTION_INPUT_POINTS": 90,
+    "MAX_CONGESTION_SEGMENTS": 500,
+    "DEFAULT_CONGESTION_BUCKET_MINUTES": 15,
+    "DEFAULT_ETA_SPEED_KMH": 28.0,
     "ANIMATION_MIN_DELAY_MS": 80,
     "ANIMATION_MAX_DELAY_MS": 2500,
     "ANIMATION_GAP_THRESHOLD_S": 1800,
@@ -526,6 +531,580 @@ def _shortest_path_nodes(graph, source, target, undirected_graph=None):
         if undirected_graph is None:
             raise exc
         return nx.shortest_path(undirected_graph, source, target, weight="length"), "undirected"
+
+
+def _edge_length_km(graph, source, target):
+    if source == target:
+        return 0.0
+    edge_data = graph.get_edge_data(source, target) if hasattr(graph, "get_edge_data") else None
+    if not edge_data and hasattr(graph, "get_edge_data"):
+        edge_data = graph.get_edge_data(target, source)
+    if not edge_data:
+        point_a = _node_lat_lng(graph, source)
+        point_b = _node_lat_lng(graph, target)
+        if point_a and point_b:
+            return haversine_distance(point_a[0], point_a[1], point_b[0], point_b[1])
+        return np.nan
+    if isinstance(edge_data, dict) and all(isinstance(value, dict) for value in edge_data.values()):
+        lengths = [attrs.get("length") for attrs in edge_data.values() if attrs and attrs.get("length") is not None]
+    else:
+        lengths = [edge_data.get("length")] if edge_data.get("length") is not None else []
+    if not lengths:
+        point_a = _node_lat_lng(graph, source)
+        point_b = _node_lat_lng(graph, target)
+        if point_a and point_b:
+            return haversine_distance(point_a[0], point_a[1], point_b[0], point_b[1])
+        return np.nan
+    return float(min(lengths)) / 1000.0
+
+
+def _path_length_km(graph, path_nodes):
+    total = 0.0
+    for idx in range(1, len(path_nodes or [])):
+        length_km = _edge_length_km(graph, path_nodes[idx - 1], path_nodes[idx])
+        if pd.notna(length_km):
+            total += float(length_km)
+    return total
+
+
+def _segment_key(source, target):
+    return f"{source}->{target}"
+
+
+def speed_to_color(speed_kmh):
+    if speed_kmh is None or pd.isna(speed_kmh):
+        return "#9ca3af"
+    speed = float(speed_kmh)
+    if speed < 15:
+        return "#dc2626"
+    if speed < 25:
+        return "#f97316"
+    if speed < 40:
+        return "#eab308"
+    return "#16a34a"
+
+
+def speed_to_level(speed_kmh):
+    if speed_kmh is None or pd.isna(speed_kmh):
+        return "未知"
+    speed = float(speed_kmh)
+    if speed < 15:
+        return "严重拥堵"
+    if speed < 25:
+        return "拥堵"
+    if speed < 40:
+        return "缓行"
+    return "畅通"
+
+
+def approximate_hmm_match_trajectory(df, graph=None, network_meta=None):
+    if df is None or len(df) < 2:
+        return {
+            "segments": pd.DataFrame(),
+            "matched_nodes": [],
+            "meta": {"success": False, "error": "轨迹点不足，无法执行地图匹配。"},
+        }
+
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return {
+            "segments": pd.DataFrame(),
+            "matched_nodes": [],
+            "meta": {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta},
+        }
+
+    sample_df = resample_trajectory(df, CONFIG["MAX_CONGESTION_INPUT_POINTS"])
+    matched_nodes = []
+    nearest_failures = 0
+    for _, row in sample_df.iterrows():
+        try:
+            matched_nodes.append(nearest_road_node(graph, row["long"], row["lati"]))
+        except Exception:
+            nearest_failures += 1
+            matched_nodes.append(None)
+            log.exception("HMM 近似匹配最近节点失败: lng=%s, lat=%s", row.get("long"), row.get("lati"))
+
+    undirected_graph = None
+    rows = []
+    path_failures = 0
+    undirected_segments = 0
+    same_node_segments = 0
+
+    for idx in range(1, len(sample_df)):
+        source = matched_nodes[idx - 1]
+        target = matched_nodes[idx]
+        if source is None or target is None:
+            continue
+
+        prev_row = sample_df.iloc[idx - 1]
+        row = sample_df.iloc[idx]
+        time_diff_s = (row["time"] - prev_row["time"]).total_seconds() if pd.notna(row["time"]) and pd.notna(prev_row["time"]) else 0
+        if time_diff_s <= 0:
+            continue
+
+        gps_distance_km = haversine_distance(prev_row["lati"], prev_row["long"], row["lati"], row["long"])
+        if pd.isna(gps_distance_km) or gps_distance_km > CONFIG["ANIMATION_DRIFT_CAP_KM"]:
+            continue
+
+        observed_speed = float(row.get("speed", 0.0) or 0.0)
+        if observed_speed <= 0:
+            observed_speed = float(gps_distance_km / (time_diff_s / 3600.0)) if time_diff_s > 0 else 0.0
+        if observed_speed > CONFIG["ANIMATION_SPEED_CAP_KMH"]:
+            continue
+
+        if undirected_graph is None and source != target and hasattr(graph, "is_directed") and graph.is_directed():
+            try:
+                undirected_graph = graph.to_undirected(as_view=True)
+            except TypeError:
+                undirected_graph = graph.to_undirected()
+        try:
+            path_nodes, mode = _shortest_path_nodes(graph, source, target, undirected_graph=undirected_graph)
+            if mode == "undirected":
+                undirected_segments += 1
+            elif mode == "same_node":
+                same_node_segments += 1
+        except Exception:
+            path_failures += 1
+            log.exception("HMM 近似匹配转移路径失败: source=%s, target=%s", source, target)
+            continue
+
+        path_distance_km = _path_length_km(graph, path_nodes)
+        if path_distance_km <= 0 or pd.isna(path_distance_km):
+            path_distance_km = max(float(gps_distance_km), 0.001)
+        segment_speed = min(CONFIG["ANIMATION_SPEED_CAP_KMH"], max(1.0, path_distance_km / (time_diff_s / 3600.0)))
+        if observed_speed > 0:
+            segment_speed = min(CONFIG["ANIMATION_SPEED_CAP_KMH"], max(1.0, 0.65 * segment_speed + 0.35 * observed_speed))
+
+        for node_idx in range(1, len(path_nodes)):
+            edge_source = path_nodes[node_idx - 1]
+            edge_target = path_nodes[node_idx]
+            point_a = _node_lat_lng(graph, edge_source)
+            point_b = _node_lat_lng(graph, edge_target)
+            if not point_a or not point_b:
+                continue
+            edge_length_km = _edge_length_km(graph, edge_source, edge_target)
+            if pd.isna(edge_length_km):
+                edge_length_km = haversine_distance(point_a[0], point_a[1], point_b[0], point_b[1])
+            rows.append(
+                {
+                    "time": row["time"],
+                    "time_bucket": None,
+                    "vehicle_id": str(row.get("vehicle_id", "")),
+                    "segment_key": _segment_key(edge_source, edge_target),
+                    "source": edge_source,
+                    "target": edge_target,
+                    "lat1": point_a[0],
+                    "lng1": point_a[1],
+                    "lat2": point_b[0],
+                    "lng2": point_b[1],
+                    "speed_kmh": segment_speed,
+                    "edge_length_km": float(edge_length_km) if pd.notna(edge_length_km) else 0.0,
+                    "path_mode": mode,
+                }
+            )
+
+    segments = pd.DataFrame(rows)
+    meta = {
+        "success": len(segments) > 0,
+        "method": "近似 HMM: 最近道路节点作为发射近似，最短路连续性作为转移约束。",
+        "raw_points": len(df),
+        "sampled_points": len(sample_df),
+        "matched_nodes": sum(1 for node in matched_nodes if node is not None),
+        "segments": len(segments),
+        "nearest_failures": nearest_failures,
+        "path_failures": path_failures,
+        "undirected_segments": undirected_segments,
+        "same_node_segments": same_node_segments,
+        "network": network_meta,
+    }
+    if not meta["success"]:
+        meta["error"] = "没有生成可聚合的匹配路段。"
+    return {"segments": segments, "matched_nodes": matched_nodes, "meta": meta}
+
+
+def aggregate_road_speed_segments(segments_df, bucket_minutes=15):
+    if segments_df is None or len(segments_df) == 0:
+        return pd.DataFrame()
+
+    bucket_minutes = int(bucket_minutes or CONFIG["DEFAULT_CONGESTION_BUCKET_MINUTES"])
+    bucket_minutes = max(1, bucket_minutes)
+    df = segments_df.copy()
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time", "segment_key", "speed_kmh", "lat1", "lng1", "lat2", "lng2"])
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    df["time_bucket"] = df["time"].dt.floor(f"{bucket_minutes}min")
+    grouped = (
+        df.groupby(["time_bucket", "segment_key"], as_index=False)
+        .agg(
+            source=("source", "first"),
+            target=("target", "first"),
+            lat1=("lat1", "first"),
+            lng1=("lng1", "first"),
+            lat2=("lat2", "first"),
+            lng2=("lng2", "first"),
+            avg_speed_kmh=("speed_kmh", "mean"),
+            min_speed_kmh=("speed_kmh", "min"),
+            max_speed_kmh=("speed_kmh", "max"),
+            observation_count=("speed_kmh", "size"),
+            vehicle_count=("vehicle_id", pd.Series.nunique),
+            edge_length_km=("edge_length_km", "mean"),
+        )
+        .sort_values(["time_bucket", "avg_speed_kmh", "observation_count"], ascending=[True, True, False])
+        .reset_index(drop=True)
+    )
+    grouped["color"] = grouped["avg_speed_kmh"].apply(speed_to_color)
+    grouped["level"] = grouped["avg_speed_kmh"].apply(speed_to_level)
+    return grouped
+
+
+def _build_congestion_frames(aggregated_df, max_segments=None):
+    if aggregated_df is None or len(aggregated_df) == 0:
+        return []
+
+    max_segments = int(max_segments or CONFIG["MAX_CONGESTION_SEGMENTS"])
+    frames = []
+    for bucket, group in aggregated_df.groupby("time_bucket", sort=True):
+        display_group = group.sort_values(["observation_count", "avg_speed_kmh"], ascending=[False, True]).head(max_segments)
+        segments = []
+        for _, row in display_group.iterrows():
+            segments.append(
+                {
+                    "key": str(row["segment_key"]),
+                    "points": [[float(row["lat1"]), float(row["lng1"])], [float(row["lat2"]), float(row["lng2"])]],
+                    "speed": round(float(row["avg_speed_kmh"]), 1),
+                    "count": int(row["observation_count"]),
+                    "vehicles": int(row["vehicle_count"]),
+                    "level": str(row["level"]),
+                    "color": str(row["color"]),
+                }
+            )
+        frames.append(
+            {
+                "label": pd.Timestamp(bucket).strftime("%Y-%m-%d %H:%M"),
+                "segments": segments,
+            }
+        )
+    return frames
+
+
+def _add_congestion_player(m, frames, bucket_minutes):
+    if not frames:
+        return
+
+    map_name = m.get_name()
+    control_id = f"congestion-player-{map_name}"
+    frames_json = json.dumps(frames, ensure_ascii=False)
+    html = f"""
+    <div id="{control_id}" style="position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.35);border-radius:12px;padding:10px 12px;box-shadow:0 12px 32px rgba(15,23,42,0.16);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:360px;max-width:680px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <button type="button" data-role="toggle" style="border:1px solid #cbd5e1;background:#0f172a;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;">播放</button>
+        <input type="range" data-role="slider" min="0" max="{len(frames) - 1}" value="0" step="1" style="flex:1;">
+        <span data-role="label" style="font-size:12px;color:#334155;min-width:128px;text-align:right;">{frames[0]['label']}</span>
+      </div>
+      <div style="font-size:11px;color:#64748b;margin-top:6px;">按 {bucket_minutes} 分钟聚合路段平均速度；红/橙/黄/绿分别表示严重拥堵、拥堵、缓行、畅通。</div>
+    </div>
+    """
+    script = f"""
+    (function() {{
+      const frames = {frames_json};
+      const map = {map_name};
+      const container = document.getElementById({json.dumps(control_id)});
+      if (!map || !container || !window.L || !frames.length) return;
+      const slider = container.querySelector('[data-role="slider"]');
+      const label = container.querySelector('[data-role="label"]');
+      const button = container.querySelector('[data-role="toggle"]');
+      const layer = L.layerGroup().addTo(map);
+      let timer = null;
+      let index = 0;
+
+      function renderFrame(nextIndex) {{
+        index = Math.max(0, Math.min(frames.length - 1, Number(nextIndex) || 0));
+        const frame = frames[index];
+        layer.clearLayers();
+        frame.segments.forEach(function(seg) {{
+          L.polyline(seg.points, {{
+            color: seg.color,
+            weight: Math.min(9, 4 + Math.log2(Math.max(1, seg.count))),
+            opacity: 0.86,
+            lineCap: 'round',
+            lineJoin: 'round'
+          }}).bindTooltip(
+            '路段 ' + seg.key + '<br>平均速度: ' + seg.speed + ' km/h<br>状态: ' + seg.level + '<br>样本: ' + seg.count + ' / 车辆: ' + seg.vehicles,
+            {{sticky: true}}
+          ).addTo(layer);
+        }});
+        slider.value = String(index);
+        label.textContent = frame.label + ' (' + frame.segments.length + '段)';
+      }}
+
+      function stop() {{
+        if (timer) window.clearInterval(timer);
+        timer = null;
+        button.textContent = '播放';
+      }}
+
+      function play() {{
+        stop();
+        button.textContent = '暂停';
+        timer = window.setInterval(function() {{
+          const next = index >= frames.length - 1 ? 0 : index + 1;
+          renderFrame(next);
+        }}, 900);
+      }}
+
+      slider.addEventListener('input', function() {{
+        stop();
+        renderFrame(slider.value);
+      }});
+      button.addEventListener('click', function() {{
+        if (timer) stop();
+        else play();
+      }});
+      renderFrame(0);
+    }})();
+    """
+    m.get_root().html.add_child(folium.Element(html))
+    m.get_root().script.add_child(folium.Element(script))
+
+
+def estimate_eta_between_points(start_lat, start_lng, end_lat, end_lng, departure_time=None, historical_segments=None, graph=None, network_meta=None):
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    try:
+        source = nearest_road_node(graph, start_lng, start_lat)
+        target = nearest_road_node(graph, end_lng, end_lat)
+    except Exception as exc:
+        log.exception("ETA 起终点最近节点匹配失败")
+        return {"success": False, "error": f"起终点无法匹配到路网节点: {exc}", "network": network_meta}
+
+    undirected_graph = None
+    if source != target and hasattr(graph, "is_directed") and graph.is_directed():
+        try:
+            undirected_graph = graph.to_undirected(as_view=True)
+        except TypeError:
+            undirected_graph = graph.to_undirected()
+    try:
+        path_nodes, mode = _shortest_path_nodes(graph, source, target, undirected_graph=undirected_graph)
+    except Exception as exc:
+        log.exception("ETA 最短路径失败: source=%s, target=%s", source, target)
+        return {"success": False, "error": f"起终点之间没有可用道路路径: {exc}", "network": network_meta}
+
+    route_points = [_node_lat_lng(graph, node) for node in path_nodes]
+    route_points = [point for point in route_points if point]
+    distance_km = _path_length_km(graph, path_nodes)
+    if distance_km <= 0 or pd.isna(distance_km):
+        distance_km = haversine_distance(start_lat, start_lng, end_lat, end_lng)
+
+    speed_candidates = []
+    if historical_segments is not None and len(historical_segments) > 0:
+        hist = historical_segments.copy()
+        route_keys = set()
+        for idx in range(1, len(path_nodes)):
+            route_keys.add(_segment_key(path_nodes[idx - 1], path_nodes[idx]))
+            route_keys.add(_segment_key(path_nodes[idx], path_nodes[idx - 1]))
+        if route_keys and "segment_key" in hist.columns:
+            matched = hist[hist["segment_key"].isin(route_keys)]
+            speed_candidates.extend(matched["avg_speed_kmh"].dropna().astype(float).tolist())
+        if not speed_candidates and "avg_speed_kmh" in hist.columns:
+            speed_candidates.extend(hist["avg_speed_kmh"].dropna().astype(float).tolist())
+
+    avg_speed_kmh = float(np.mean(speed_candidates)) if speed_candidates else CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    avg_speed_kmh = max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], avg_speed_kmh))
+    duration_minutes = float(distance_km / avg_speed_kmh * 60.0) if avg_speed_kmh > 0 else np.nan
+    departure_dt = safe_datetime(departure_time)
+    arrival_time = None
+    if departure_dt is not None and pd.notna(duration_minutes):
+        arrival_time = departure_dt + pd.to_timedelta(duration_minutes, unit="m")
+
+    return {
+        "success": True,
+        "method": "路网最短距离 + 当前窗口历史路段平均速度；若路线无历史样本，则使用全局历史均速或默认速度。",
+        "source_node": source,
+        "target_node": target,
+        "path_mode": mode,
+        "distance_km": float(distance_km),
+        "avg_speed_kmh": float(avg_speed_kmh),
+        "duration_minutes": duration_minutes,
+        "arrival_time": arrival_time,
+        "route_points": route_points,
+        "historical_speed_samples": len(speed_candidates),
+        "network": network_meta,
+    }
+
+
+def plot_congestion_roads_and_eta(
+    vehicle_ids,
+    start_time=None,
+    end_time=None,
+    bucket_minutes=15,
+    eta_start=None,
+    eta_end=None,
+    save_path=None,
+):
+    cleaned_vehicle_ids = []
+    for vehicle_id in vehicle_ids or []:
+        vehicle_id = str(vehicle_id).strip()
+        if vehicle_id and vehicle_id not in cleaned_vehicle_ids:
+            cleaned_vehicle_ids.append(vehicle_id)
+    cleaned_vehicle_ids = cleaned_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
+    if not cleaned_vehicle_ids:
+        return None, {"success": False, "error": f"请选择 1-{CONFIG['MAX_CONGESTION_VEHICLES']} 辆车用于 HMM 拥堵道路示例。"}
+
+    bucket_minutes = int(bucket_minutes or CONFIG["DEFAULT_CONGESTION_BUCKET_MINUTES"])
+    graph, network_meta = load_road_network()
+    if graph is None:
+        return None, {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    loaded_frames = []
+    all_segments = []
+    match_summaries = []
+    per_vehicle_limit = max(60, min(CONFIG["MAX_CONGESTION_INPUT_POINTS"], CONFIG["MAX_TRAJECTORY_POINTS"] // max(1, len(cleaned_vehicle_ids))))
+    for index, vehicle_id in enumerate(cleaned_vehicle_ids):
+        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+        if df is None or len(df) < 2:
+            match_summaries.append({"vehicle_id": vehicle_id, "success": False, "message": "当前时间范围轨迹点不足。"})
+            continue
+        df = resample_trajectory(df, per_vehicle_limit).assign(vehicle_id=vehicle_id)
+        loaded_frames.append(df)
+        match_result = approximate_hmm_match_trajectory(df, graph=graph, network_meta=network_meta)
+        meta = match_result["meta"]
+        match_summaries.append(
+            {
+                "vehicle_id": vehicle_id,
+                "success": bool(meta.get("success")),
+                "method": meta.get("method", ""),
+                "raw_points": meta.get("raw_points", len(df)),
+                "sampled_points": meta.get("sampled_points", 0),
+                "matched_nodes": meta.get("matched_nodes", 0),
+                "segments": meta.get("segments", 0),
+                "nearest_failures": meta.get("nearest_failures", 0),
+                "path_failures": meta.get("path_failures", 0),
+                "undirected_segments": meta.get("undirected_segments", 0),
+                "message": meta.get("error", "匹配完成。"),
+            }
+        )
+        if len(match_result["segments"]) > 0:
+            all_segments.append(match_result["segments"].assign(vehicle_id=vehicle_id))
+
+    if not loaded_frames:
+        return None, {"success": False, "error": "所选车辆在当前时间范围内没有轨迹数据。", "network": network_meta, "matches": match_summaries}
+
+    combined_df = pd.concat(loaded_frames, ignore_index=True)
+    m = build_map(combined_df)
+    if not all_segments:
+        add_map_layers(m)
+        return None, {
+            "success": False,
+            "error": "HMM 近似匹配没有生成可聚合路段。",
+            "network": network_meta,
+            "matches": match_summaries,
+        }
+
+    segments_df = pd.concat(all_segments, ignore_index=True)
+    aggregated = aggregate_road_speed_segments(segments_df, bucket_minutes=bucket_minutes)
+    frames = _build_congestion_frames(aggregated, max_segments=CONFIG["MAX_CONGESTION_SEGMENTS"])
+
+    matched_layer = folium.FeatureGroup(name="匹配后的道路轨迹", show=False).add_to(m)
+    display_segments = segments_df.head(CONFIG["MAX_CONGESTION_SEGMENTS"])
+    for _, row in display_segments.iterrows():
+        folium.PolyLine(
+            [[row["lat1"], row["lng1"]], [row["lat2"], row["lng2"]]],
+            color=speed_to_color(row["speed_kmh"]),
+            weight=3,
+            opacity=0.42,
+            tooltip=f"车辆 {row['vehicle_id']} 匹配路段 {row['segment_key']}",
+        ).add_to(matched_layer)
+
+    eta_result = None
+    if eta_start and eta_end:
+        eta_result = estimate_eta_between_points(
+            eta_start[0],
+            eta_start[1],
+            eta_end[0],
+            eta_end[1],
+            departure_time=start_time,
+            historical_segments=aggregated,
+            graph=graph,
+            network_meta=network_meta,
+        )
+        if eta_result.get("success") and len(eta_result.get("route_points", [])) >= 2:
+            route_points = eta_result["route_points"]
+            if len(route_points) > 800:
+                idx = np.linspace(0, len(route_points) - 1, num=800, dtype=int)
+                route_points = [route_points[i] for i in idx]
+            folium.PolyLine(
+                route_points,
+                color="#2563eb",
+                weight=6,
+                opacity=0.9,
+                tooltip=f"ETA 路径: {eta_result['distance_km']:.2f} km / {eta_result['duration_minutes']:.1f} 分钟",
+            ).add_to(m)
+            folium.Marker(
+                [eta_start[0], eta_start[1]],
+                icon=folium.Icon(color="green", icon="play"),
+                tooltip="ETA 起点",
+            ).add_to(m)
+            folium.Marker(
+                [eta_end[0], eta_end[1]],
+                icon=folium.Icon(color="red", icon="flag"),
+                tooltip="ETA 终点",
+            ).add_to(m)
+
+    legend_html = f"""
+    <div style="position:fixed;right:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.35);border-radius:12px;padding:12px 14px;box-shadow:0 12px 32px rgba(15,23,42,0.12);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:220px;max-width:340px;">
+      <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:6px;">拥堵道路图例</div>
+      <div style="display:grid;grid-template-columns:18px 1fr;gap:6px 8px;font-size:12px;color:#334155;align-items:center;">
+        <span style="height:4px;background:#dc2626;"></span><span>&lt;15 km/h 严重拥堵</span>
+        <span style="height:4px;background:#f97316;"></span><span>15-25 km/h 拥堵</span>
+        <span style="height:4px;background:#eab308;"></span><span>25-40 km/h 缓行</span>
+        <span style="height:4px;background:#16a34a;"></span><span>&gt;=40 km/h 畅通</span>
+        <span style="height:4px;background:#2563eb;"></span><span>ETA 最短路</span>
+      </div>
+      <div style="font-size:11px;color:#64748b;line-height:1.45;border-top:1px solid rgba(148,163,184,0.25);padding-top:8px;margin-top:8px;">近似 HMM: 最近道路节点 + 最短路转移约束。点击地图可显示经纬度，底部滑块播放时间片。</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+    _add_congestion_player(m, frames, bucket_minutes)
+    add_map_layers(m)
+
+    start_str = format_time_tag(start_time)
+    end_str = format_time_tag(end_time)
+    vehicle_tag = "-".join(cleaned_vehicle_ids[:3])
+    output_path = save_path or os.path.join(
+        CONFIG["OUTPUT_MAP_DIR"],
+        f"congestion_hmm_eta_{vehicle_tag}_{start_str}_{end_str}_{bucket_minutes}min.html",
+    )
+    ensure_parent_dir(output_path)
+    m.save(output_path)
+
+    info = {
+        "success": bool(frames),
+        "output_path": output_path,
+        "vehicles": len(loaded_frames),
+        "bucket_minutes": bucket_minutes,
+        "matched_segment_rows": len(segments_df),
+        "aggregated_segments": len(aggregated),
+        "frame_count": len(frames),
+        "matches": match_summaries,
+        "eta": eta_result,
+        "network": network_meta,
+    }
+    log.info(
+        "HMM拥堵道路与ETA地图已保存: output=%s, vehicles=%s, frames=%s, segments=%s",
+        output_path,
+        len(loaded_frames),
+        len(frames),
+        len(aggregated),
+    )
+    return output_path, info
 
 
 def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
@@ -1773,6 +2352,344 @@ def plot_road_corrected_trajectories(vehicle_ids, start_time=None, end_time=None
         network_label,
     )
     return output_path, info
+
+
+def build_congestion_segments(vehicle_ids, start_time=None, end_time=None, bucket_minutes=15):
+    cleaned_vehicle_ids = []
+    for vehicle_id in vehicle_ids or []:
+        vehicle_id = str(vehicle_id).strip()
+        if vehicle_id and vehicle_id not in cleaned_vehicle_ids:
+            cleaned_vehicle_ids.append(vehicle_id)
+    cleaned_vehicle_ids = cleaned_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
+
+    graph, network_meta = load_road_network()
+    if graph is None:
+        return pd.DataFrame(), {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    matched_frames = []
+    matching_rows = []
+    for vehicle_id in cleaned_vehicle_ids:
+        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+        if df is None or len(df) < 2:
+            matching_rows.append({"vehicle_id": vehicle_id, "success": False, "message": "当前时间范围内轨迹点不足。"})
+            continue
+        df = df.copy()
+        df["vehicle_id"] = vehicle_id
+        result = approximate_hmm_match_trajectory(df, graph=graph, network_meta=network_meta)
+        meta = result["meta"]
+        matching_rows.append(
+            {
+                "vehicle_id": vehicle_id,
+                "success": bool(meta.get("success")),
+                "raw_points": meta.get("raw_points", len(df)),
+                "sampled_points": meta.get("sampled_points", 0),
+                "matched_nodes": meta.get("matched_nodes", 0),
+                "segments": meta.get("segments", 0),
+                "path_failures": meta.get("path_failures", 0),
+                "nearest_failures": meta.get("nearest_failures", 0),
+                "message": meta.get("error", "匹配完成。"),
+            }
+        )
+        segments = result["segments"]
+        if segments is not None and len(segments) > 0:
+            matched_frames.append(segments)
+
+    if not matched_frames:
+        return pd.DataFrame(), {
+            "success": False,
+            "error": "没有生成可聚合的路段速度。",
+            "network": network_meta,
+            "matching": matching_rows,
+        }
+
+    matched_df = pd.concat(matched_frames, ignore_index=True)
+    bucket_minutes = int(bucket_minutes or 15)
+    matched_df["time_bucket"] = pd.to_datetime(matched_df["time"]).dt.floor(f"{bucket_minutes}min")
+    grouped = (
+        matched_df.groupby(["time_bucket", "segment_key"], as_index=False)
+        .agg(
+            speed_kmh=("speed_kmh", "mean"),
+            vehicle_count=("vehicle_id", "nunique"),
+            sample_count=("speed_kmh", "size"),
+            edge_length_km=("edge_length_km", "mean"),
+            lat1=("lat1", "first"),
+            lng1=("lng1", "first"),
+            lat2=("lat2", "first"),
+            lng2=("lng2", "first"),
+        )
+        .sort_values(["time_bucket", "sample_count"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    grouped["color"] = grouped["speed_kmh"].apply(speed_to_color)
+    grouped["level"] = grouped["speed_kmh"].apply(speed_to_level)
+    if len(grouped) > CONFIG["MAX_CONGESTION_SEGMENTS"]:
+        grouped = (
+            grouped.sort_values(["time_bucket", "sample_count", "edge_length_km"], ascending=[True, False, False])
+            .groupby("time_bucket", group_keys=False)
+            .head(max(20, CONFIG["MAX_CONGESTION_SEGMENTS"] // max(1, grouped["time_bucket"].nunique())))
+            .head(CONFIG["MAX_CONGESTION_SEGMENTS"])
+            .reset_index(drop=True)
+        )
+
+    meta = {
+        "success": True,
+        "method": "近似 HMM: 最近道路节点作为发射近似，最短路连续性作为转移约束。",
+        "vehicles": len(cleaned_vehicle_ids),
+        "bucket_minutes": bucket_minutes,
+        "segment_rows": len(grouped),
+        "time_slices": int(grouped["time_bucket"].nunique()),
+        "network": network_meta,
+        "matching": matching_rows,
+    }
+    return grouped, meta
+
+
+def _congestion_legend_html(title, subtitle, network_label=None):
+    network_line = f'<div style="font-size:11px;color:#64748b;line-height:1.45;border-top:1px solid rgba(148,163,184,0.25);padding-top:8px;">路网: {network_label}</div>' if network_label else ""
+    return f"""
+    <div style="position:fixed;right:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.35);border-radius:12px;padding:12px 14px;box-shadow:0 12px 32px rgba(15,23,42,0.12);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:210px;max-width:340px;">
+      <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:6px;">{title}</div>
+      <div style="font-size:12px;color:#64748b;line-height:1.5;margin-bottom:8px;">{subtitle}</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;"><span style="width:24px;border-top:5px solid #dc2626;"></span><span style="font-size:12px;color:#334155;">&lt; 15 km/h 严重拥堵</span></div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;"><span style="width:24px;border-top:5px solid #f97316;"></span><span style="font-size:12px;color:#334155;">15-25 km/h 拥堵</span></div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;"><span style="width:24px;border-top:5px solid #eab308;"></span><span style="font-size:12px;color:#334155;">25-40 km/h 缓行</span></div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;"><span style="width:24px;border-top:5px solid #16a34a;"></span><span style="font-size:12px;color:#334155;">≥ 40 km/h 畅通</span></div>
+      {network_line}
+    </div>
+    """
+
+
+def _inject_congestion_player(m, grouped):
+    map_name = m.get_name()
+    panel_id = f"congestion-player-{map_name}"
+    rows = []
+    for _, row in grouped.iterrows():
+        rows.append(
+            {
+                "bucket": pd.Timestamp(row["time_bucket"]).strftime("%H:%M"),
+                "segmentKey": row["segment_key"],
+                "points": [[float(row["lat1"]), float(row["lng1"])], [float(row["lat2"]), float(row["lng2"])]],
+                "speed": round(float(row["speed_kmh"]), 1),
+                "color": row["color"],
+                "level": row["level"],
+                "samples": int(row["sample_count"]),
+                "vehicles": int(row["vehicle_count"]),
+            }
+        )
+    player_html = f"""
+    <div id="{panel_id}" style="position:fixed;left:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:260px;">
+      <div style="font-size:12px;font-weight:800;margin-bottom:6px;">路段速度播放</div>
+      <div data-role="bucket" style="font-size:12px;color:#475569;margin-bottom:8px;">准备中</div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button data-role="play" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:4px 10px;cursor:pointer;">播放</button>
+        <input data-role="slider" type="range" min="0" max="0" value="0" style="width:150px;accent-color:#2563eb;">
+      </div>
+    </div>
+    """
+    player_js = f"""
+    (function bindCongestionPlayer() {{
+        var map = window[{json.dumps(map_name)}];
+        var panel = document.getElementById({json.dumps(panel_id)});
+        if (!map || !panel || typeof L === 'undefined') {{
+            window.setTimeout(bindCongestionPlayer, 50);
+            return;
+        }}
+        var rows = {json.dumps(rows, ensure_ascii=False)};
+        var buckets = Array.from(new Set(rows.map(function(row) {{ return row.bucket; }})));
+        var layerGroup = L.layerGroup().addTo(map);
+        var slider = panel.querySelector('[data-role="slider"]');
+        var playButton = panel.querySelector('[data-role="play"]');
+        var label = panel.querySelector('[data-role="bucket"]');
+        var timer = null;
+        slider.max = Math.max(0, buckets.length - 1);
+        function render(index) {{
+            layerGroup.clearLayers();
+            var bucket = buckets[index] || '';
+            var bucketRows = rows.filter(function(row) {{ return row.bucket === bucket; }});
+            bucketRows.forEach(function(row) {{
+                L.polyline(row.points, {{
+                    color: row.color,
+                    weight: 6,
+                    opacity: 0.86,
+                    lineCap: 'round'
+                }}).bindTooltip(
+                    row.segmentKey + '<br>' + row.level + ' ' + row.speed + ' km/h<br>样本 ' + row.samples + ' / 车辆 ' + row.vehicles
+                ).addTo(layerGroup);
+            }});
+            label.textContent = bucket ? ('时间片 ' + bucket + '，路段 ' + bucketRows.length + ' 条') : '无可播放路段';
+            slider.value = index;
+        }}
+        slider.addEventListener('input', function() {{
+            render(Number(slider.value || 0));
+        }});
+        playButton.addEventListener('click', function() {{
+            if (timer) {{
+                window.clearInterval(timer);
+                timer = null;
+                playButton.textContent = '播放';
+                return;
+            }}
+            playButton.textContent = '暂停';
+            timer = window.setInterval(function() {{
+                var next = (Number(slider.value || 0) + 1) % Math.max(1, buckets.length);
+                render(next);
+            }}, 900);
+        }});
+        render(0);
+    }})();
+    """
+    m.get_root().html.add_child(folium.Element(player_html))
+    m.get_root().script.add_child(folium.Element(player_js))
+
+
+def plot_congestion_roads(vehicle_ids, start_time=None, end_time=None, bucket_minutes=15, save_path=None):
+    grouped, meta = build_congestion_segments(vehicle_ids, start_time, end_time, bucket_minutes=bucket_minutes)
+    if grouped is None or len(grouped) == 0:
+        return None, meta
+
+    map_df = pd.DataFrame(
+        {
+            "lati": pd.concat([grouped["lat1"], grouped["lat2"]], ignore_index=True),
+            "long": pd.concat([grouped["lng1"], grouped["lng2"]], ignore_index=True),
+        }
+    )
+    m = build_map(map_df)
+    _inject_congestion_player(m, grouped)
+    network_label = meta.get("network", {}).get("path") or "未加载"
+    m.get_root().html.add_child(
+        folium.Element(
+            _congestion_legend_html(
+                "拥堵道路图例",
+                "颜色来自每个时间片内匹配路段的平均速度。拖动左侧滑块可查看不同时间片。",
+                network_label=network_label,
+            )
+        )
+    )
+    add_map_layers(m)
+
+    start_str = format_time_tag(start_time)
+    end_str = format_time_tag(end_time)
+    vehicle_tag = "-".join([str(item).strip() for item in (vehicle_ids or [])][:3]) or "all"
+    output_path = save_path or os.path.join(
+        CONFIG["OUTPUT_MAP_DIR"],
+        f"congestion_roads_{vehicle_tag}_{start_str}_{end_str}_{int(bucket_minutes)}m.html",
+    )
+    ensure_parent_dir(output_path)
+    m.save(output_path)
+    meta["output_path"] = output_path
+    return output_path, meta
+
+
+def _historical_speed_lookup(grouped):
+    if grouped is None or len(grouped) == 0:
+        return {}, CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    speeds = pd.to_numeric(grouped["speed_kmh"], errors="coerce").dropna()
+    global_speed = float(speeds[(speeds > 0) & (speeds <= CONFIG["ANIMATION_SPEED_CAP_KMH"])].mean()) if len(speeds) else np.nan
+    if pd.isna(global_speed) or global_speed <= 0:
+        global_speed = CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    lookup = {}
+    for _, row in grouped.iterrows():
+        speed = float(row["speed_kmh"]) if pd.notna(row["speed_kmh"]) else global_speed
+        lookup[row["segment_key"]] = max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], speed))
+    return lookup, global_speed
+
+
+def estimate_eta(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids=None, start_time=None, end_time=None, bucket_minutes=15):
+    graph, network_meta = load_road_network()
+    if graph is None:
+        return {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    try:
+        origin_node = nearest_road_node(graph, origin_lng, origin_lat)
+        dest_node = nearest_road_node(graph, dest_lng, dest_lat)
+    except Exception as exc:
+        log.exception("ETA 起终点最近节点匹配失败")
+        return {"success": False, "error": f"起终点最近道路节点匹配失败: {exc}", "network": network_meta}
+
+    undirected_graph = None
+    if hasattr(graph, "is_directed") and graph.is_directed():
+        try:
+            undirected_graph = graph.to_undirected(as_view=True)
+        except TypeError:
+            undirected_graph = graph.to_undirected()
+    try:
+        path_nodes, path_mode = _shortest_path_nodes(graph, origin_node, dest_node, undirected_graph=undirected_graph)
+    except Exception as exc:
+        log.exception("ETA 最短路径失败")
+        return {"success": False, "error": f"起终点之间没有可用路网路径: {exc}", "network": network_meta}
+
+    grouped, speed_meta = build_congestion_segments(vehicle_ids or [], start_time, end_time, bucket_minutes=bucket_minutes)
+    speed_lookup, global_speed = _historical_speed_lookup(grouped)
+    route_points = []
+    route_segments = []
+    eta_hours = 0.0
+    total_distance_km = 0.0
+    for idx, node in enumerate(path_nodes):
+        point = _node_lat_lng(graph, node)
+        if point:
+            route_points.append(point)
+        if idx == 0:
+            continue
+        source = path_nodes[idx - 1]
+        target = node
+        length_km = _edge_length_km(graph, source, target)
+        if pd.isna(length_km) or length_km <= 0:
+            prev_point = _node_lat_lng(graph, source)
+            cur_point = _node_lat_lng(graph, target)
+            length_km = haversine_distance(prev_point[0], prev_point[1], cur_point[0], cur_point[1]) if prev_point and cur_point else 0.0
+        speed = speed_lookup.get(_segment_key(source, target), global_speed)
+        total_distance_km += float(length_km)
+        eta_hours += float(length_km) / max(5.0, float(speed))
+        route_segments.append({"segment_key": _segment_key(source, target), "length_km": float(length_km), "speed_kmh": float(speed)})
+
+    return {
+        "success": len(route_points) >= 2,
+        "origin_node": origin_node,
+        "dest_node": dest_node,
+        "path_mode": path_mode,
+        "distance_km": total_distance_km,
+        "eta_minutes": eta_hours * 60.0,
+        "avg_speed_kmh": total_distance_km / eta_hours if eta_hours > 0 else global_speed,
+        "route_points": route_points,
+        "route_segments": route_segments,
+        "historical_speed_kmh": global_speed,
+        "method": "路网最短路径距离 + 当前查询时段匹配路段历史平均速度；缺失路段使用查询样本全局均速。",
+        "network": network_meta,
+        "speed_meta": speed_meta,
+    }
+
+
+def plot_eta_route(eta_result, save_path=None):
+    if not eta_result or not eta_result.get("success"):
+        return None
+    route_points = eta_result.get("route_points", [])
+    map_df = pd.DataFrame({"lati": [point[0] for point in route_points], "long": [point[1] for point in route_points]})
+    m = build_map(map_df)
+    folium.PolyLine(
+        route_points,
+        color="#2563eb",
+        weight=6,
+        opacity=0.88,
+        tooltip=f"ETA {eta_result.get('eta_minutes', 0):.1f} 分钟 / {eta_result.get('distance_km', 0):.2f} km",
+    ).add_to(m)
+    if route_points:
+        folium.Marker(route_points[0], tooltip="ETA 起点", icon=folium.Icon(color="green", icon="play")).add_to(m)
+        folium.Marker(route_points[-1], tooltip="ETA 终点", icon=folium.Icon(color="red", icon="flag")).add_to(m)
+    network_label = eta_result.get("network", {}).get("path") or "未加载"
+    m.get_root().html.add_child(
+        folium.Element(
+            _congestion_legend_html(
+                "ETA 路线",
+                f"预计 {eta_result.get('eta_minutes', 0):.1f} 分钟，距离 {eta_result.get('distance_km', 0):.2f} km，均速 {eta_result.get('avg_speed_kmh', 0):.1f} km/h。",
+                network_label=network_label,
+            )
+        )
+    )
+    add_map_layers(m)
+    output_path = save_path or os.path.join(CONFIG["OUTPUT_MAP_DIR"], "eta_route.html")
+    ensure_parent_dir(output_path)
+    m.save(output_path)
+    return output_path
 
 
 def load_minute_data(target_time):

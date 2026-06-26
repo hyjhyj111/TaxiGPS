@@ -38,7 +38,10 @@ from map_plotter import (  # noqa: E402
     load_minute_data,
     load_od_data,
     load_vehicle_trajectory,
+    estimate_eta,
     plot_animated_trajectory,
+    plot_congestion_roads,
+    plot_eta_route,
     plot_multi_vehicle_animated_trajectory,
     plot_minute_vehicles,
     plot_od_points,
@@ -53,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
-VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析"]
+VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "拥堵与ETA"]
 
 
 DEFAULTS = {
@@ -90,6 +93,11 @@ DEFAULTS = {
     "operation_stats_request": None,
     "last_active_view": "轨迹查询",
     "road_correction_enabled": False,
+    "congestion_bucket_minutes": 15,
+    "eta_origin_lat": float(CONFIG["MAP_CENTER"][0]),
+    "eta_origin_lng": float(CONFIG["MAP_CENTER"][1]),
+    "eta_dest_lat": 22.6008,
+    "eta_dest_lng": 114.1010,
 }
 
 
@@ -375,6 +383,25 @@ def cached_pickup_cluster_analysis(start_time, end_time, vehicle_ids=None, eps_k
 
 
 @st.cache_data(show_spinner=False, ttl=300)
+def cached_congestion_roads(vehicle_ids, start_time, end_time, bucket_minutes):
+    return plot_congestion_roads(tuple(vehicle_ids or []), start_time, end_time, bucket_minutes=bucket_minutes)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_eta_result(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids, start_time, end_time, bucket_minutes):
+    return estimate_eta(
+        origin_lat,
+        origin_lng,
+        dest_lat,
+        dest_lng,
+        vehicle_ids=tuple(vehicle_ids or []),
+        start_time=start_time,
+        end_time=end_time,
+        bucket_minutes=bucket_minutes,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
 def cached_export_bundle(query_date, order_stats, operation_stats, cluster_result=None):
     return export_statistics_bundle(query_date, order_stats, operation_stats, cluster_result=cluster_result)
 
@@ -552,6 +579,7 @@ def sidebar_form():
         - OD 点标注：展示上车点和下车点，并自动区分线路
         - 动画轨迹：在动画页面中按时间顺序播放单车运动，并显示速度变化
         - 热力图与统计分析：新增静态/动态热力图、订单统计、车辆运营统计与上车点聚类分析
+        - 拥堵与ETA：按路网匹配路段统计速度颜色，并用路网距离和历史均速估算到达时间
         """
     )
 
@@ -1424,6 +1452,96 @@ def render_heatmap_stats_view(payload):
         render_pickup_cluster_tab(payload)
 
 
+def render_congestion_eta_view(payload):
+    st.subheader("拥堵道路与 ETA")
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
+    if not trajectory_vehicle_ids:
+        st.info(f"请选择 1-{CONFIG['MAX_CONGESTION_VEHICLES']} 辆车作为 HMM 匹配和历史速度样本。")
+        return
+
+    if len(trajectory_vehicle_ids) > CONFIG["MAX_CONGESTION_VEHICLES"]:
+        st.warning(f"为保持响应速度，拥堵道路示例仅使用前 {CONFIG['MAX_CONGESTION_VEHICLES']} 辆车；可缩短时间窗口来观察更细的拥堵变化。")
+    selected_vehicle_ids = trajectory_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
+
+    status = road_network_status()
+    if status["available"]:
+        st.caption(f"路网文件: {status['path']}")
+    else:
+        st.warning("未找到路网文件。请将 shenzhen_drive.pkl 或 shenzhen_drive.graphml 放到项目根目录、data/ 或 cache/，或设置 TAXIGPS_ROAD_NETWORK_PATH。")
+        return
+
+    control_cols = st.columns([1, 1, 2])
+    with control_cols[0]:
+        bucket_minutes = st.selectbox(
+            "聚合时间片",
+            options=[5, 15, 30, 60],
+            index=[5, 15, 30, 60].index(int(st.session_state.get("congestion_bucket_minutes", 15))),
+            key="congestion_bucket_minutes",
+            help="按固定时间片统计每个匹配路段平均速度。",
+        )
+    with control_cols[1]:
+        st.metric("样本车辆", len(selected_vehicle_ids))
+    with control_cols[2]:
+        st.caption("近似 HMM 使用最近道路节点作为发射近似，并用最短路连续性约束相邻 GPS 点转移；路段 key 使用道路节点对。")
+
+    with st.spinner("正在执行近似 HMM 地图匹配并聚合路段速度..."):
+        congestion_html, congestion_meta = cached_congestion_roads(
+            selected_vehicle_ids,
+            payload["start_time"],
+            payload["end_time"],
+            bucket_minutes,
+        )
+
+    if not congestion_meta or not congestion_meta.get("success"):
+        st.error((congestion_meta or {}).get("error", "拥堵道路生成失败。"))
+    else:
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("时间片", congestion_meta.get("time_slices", 0))
+        metric_cols[1].metric("路段记录", congestion_meta.get("segment_rows", 0))
+        metric_cols[2].metric("聚合粒度", f"{congestion_meta.get('bucket_minutes', bucket_minutes)} 分钟")
+        metric_cols[3].metric("匹配方法", "近似 HMM")
+        if congestion_meta.get("matching"):
+            st.dataframe(pd.DataFrame(congestion_meta["matching"]), use_container_width=True, hide_index=True)
+        render_html_map(congestion_html, height=760)
+
+    st.markdown("#### ETA 预测")
+    eta_cols = st.columns(4)
+    with eta_cols[0]:
+        origin_lat = st.number_input("起点纬度", format="%.6f", key="eta_origin_lat")
+    with eta_cols[1]:
+        origin_lng = st.number_input("起点经度", format="%.6f", key="eta_origin_lng")
+    with eta_cols[2]:
+        dest_lat = st.number_input("终点纬度", format="%.6f", key="eta_dest_lat")
+    with eta_cols[3]:
+        dest_lng = st.number_input("终点经度", format="%.6f", key="eta_dest_lng")
+
+    with st.spinner("正在按路网距离和历史平均速度估算 ETA..."):
+        eta_result = cached_eta_result(
+            origin_lat,
+            origin_lng,
+            dest_lat,
+            dest_lng,
+            selected_vehicle_ids,
+            payload["start_time"],
+            payload["end_time"],
+            bucket_minutes,
+        )
+
+    if not eta_result.get("success"):
+        st.error(eta_result.get("error", "ETA 估算失败。"))
+        return
+
+    eta_metric_cols = st.columns(4)
+    eta_metric_cols[0].metric("预计耗时", f"{eta_result['eta_minutes']:.1f} 分钟")
+    eta_metric_cols[1].metric("路网距离", f"{eta_result['distance_km']:.2f} km")
+    eta_metric_cols[2].metric("估算均速", f"{eta_result['avg_speed_kmh']:.1f} km/h")
+    eta_metric_cols[3].metric("历史均速", f"{eta_result['historical_speed_kmh']:.1f} km/h")
+    st.caption(eta_result.get("method", ""))
+
+    eta_path = plot_eta_route(eta_result)
+    render_html_map(eta_path, height=620)
+
+
 def main():
     try:
         init_page()
@@ -1476,6 +1594,8 @@ def main():
             render_od_view(active_payload)
         elif active_view == "热力图与统计分析":
             render_heatmap_stats_view(active_payload)
+        elif active_view == "拥堵与ETA":
+            render_congestion_eta_view(active_payload)
 
         st.markdown("---")
         st.caption("数据来源: cache/vehicles/ | cache/minutes/ | data/processed/od_table.csv | exports/heatmap_stats/")
