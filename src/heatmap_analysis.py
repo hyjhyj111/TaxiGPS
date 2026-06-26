@@ -73,9 +73,9 @@ ANALYSIS_CONFIG = {
     "DRIFT_CAP_KM": 8.0,
     "DRIFT_SPEED_CAP_KMH": 160.0,
     "ANIMATION_TARGET_FPS": 60,
-    "ANIMATION_TOTAL_MS": 12000,
-    "ANIMATION_MIN_TRANSITION_MS": 260,
-    "ANIMATION_MAX_TRANSITION_MS": 850,
+    "ANIMATION_TOTAL_MS": 18000,
+    "ANIMATION_MIN_TRANSITION_MS": 420,
+    "ANIMATION_MAX_TRANSITION_MS": 1200,
     "ANIMATION_STATUS_THROTTLE_MS": 80,
 }
 
@@ -708,6 +708,8 @@ def _build_dynamic_heatmap_player_assets(map_name, frames, source_label, radius,
         "transitionMs": int(transition_ms),
         "statusThrottleMs": int(ANALYSIS_CONFIG["ANIMATION_STATUS_THROTTLE_MS"]),
         "minVisibleWeight": float(ANALYSIS_CONFIG["MIN_DYNAMIC_VISIBLE_WEIGHT"]),
+        "transitionVisibleWeight": float(ANALYSIS_CONFIG["MIN_DYNAMIC_VISIBLE_WEIGHT"]) * 0.35,
+        "morphMaxDistance": 0.012,
         "maxInterpolatedPoints": int(ANALYSIS_CONFIG["MAX_DYNAMIC_RENDER_POINTS"]),
         "minInterpolatedPoints": int(ANALYSIS_CONFIG["MIN_INTERPOLATED_POINTS"]),
         "radius": int(round(radius * ANALYSIS_CONFIG["DYNAMIC_RADIUS_SCALE"])),
@@ -851,37 +853,89 @@ def _build_dynamic_heatmap_player_assets(map_name, frames, source_label, radius,
             fpsLabel.textContent = '约 ' + fps + 'fps · 点预算 ' + adaptivePointBudget;
         }}
 
+        function pointDistanceSq(a, b) {{
+            const dLat = a.lat - b.lat;
+            const dLng = a.lng - b.lng;
+            return dLat * dLat + dLng * dLng;
+        }}
+
         function buildTransition(index) {{
             if (transitionCache.has(index)) {{
                 return transitionCache.get(index);
             }}
-            const startPoints = (frames[index] && frames[index].points) || [];
-            const endPoints = (frames[index + 1] && frames[index + 1].points) || startPoints;
-            const pointMap = new Map();
-
-            startPoints.forEach(function(point) {{
-                const key = point[0].toFixed(4) + ',' + point[1].toFixed(4);
-                pointMap.set(key, {{ lat: point[0], lng: point[1], start: point[2], end: 0 }});
+            const startPoints = ((frames[index] && frames[index].points) || []).map(function(point) {{
+                return {{ lat: point[0], lng: point[1], weight: point[2] }};
             }});
-            endPoints.forEach(function(point) {{
-                const key = point[0].toFixed(4) + ',' + point[1].toFixed(4);
-                if (pointMap.has(key)) {{
-                    pointMap.get(key).end = point[2];
-                }} else {{
-                    pointMap.set(key, {{ lat: point[0], lng: point[1], start: 0, end: point[2] }});
+            const endPoints = ((frames[index + 1] && frames[index + 1].points) || startPoints).map(function(point) {{
+                return {{ lat: point[0], lng: point[1], weight: point[2] }};
+            }});
+            const maxDistanceSq = settings.morphMaxDistance * settings.morphMaxDistance;
+            const usedEnd = new Set();
+            const rows = [];
+
+            startPoints
+                .slice()
+                .sort(function(a, b) {{ return b.weight - a.weight; }})
+                .forEach(function(startPoint) {{
+                    let bestIndex = -1;
+                    let bestDistanceSq = Infinity;
+                    for (let i = 0; i < endPoints.length; i += 1) {{
+                        if (usedEnd.has(i)) {{
+                            continue;
+                        }}
+                        const distanceSq = pointDistanceSq(startPoint, endPoints[i]);
+                        if (distanceSq < bestDistanceSq) {{
+                            bestDistanceSq = distanceSq;
+                            bestIndex = i;
+                        }}
+                    }}
+
+                    if (bestIndex >= 0 && bestDistanceSq <= maxDistanceSq) {{
+                        const endPoint = endPoints[bestIndex];
+                        usedEnd.add(bestIndex);
+                        rows.push({{
+                            startLat: startPoint.lat,
+                            startLng: startPoint.lng,
+                            endLat: endPoint.lat,
+                            endLng: endPoint.lng,
+                            start: startPoint.weight,
+                            end: endPoint.weight
+                        }});
+                    }} else {{
+                        rows.push({{
+                            startLat: startPoint.lat,
+                            startLng: startPoint.lng,
+                            endLat: startPoint.lat,
+                            endLng: startPoint.lng,
+                            start: startPoint.weight,
+                            end: 0
+                        }});
+                    }}
+                }});
+
+            endPoints.forEach(function(endPoint, endIndex) {{
+                if (!usedEnd.has(endIndex)) {{
+                    rows.push({{
+                        startLat: endPoint.lat,
+                        startLng: endPoint.lng,
+                        endLat: endPoint.lat,
+                        endLng: endPoint.lng,
+                        start: 0,
+                        end: endPoint.weight
+                    }});
                 }}
             }});
 
-            const rows = Array.from(pointMap.values())
+            const transitionRows = rows
                 .filter(function(item) {{
-                    return Math.max(item.start, item.end) >= settings.minVisibleWeight;
+                    return Math.max(item.start, item.end) >= settings.transitionVisibleWeight;
                 }})
                 .sort(function(a, b) {{
                     return Math.max(b.start, b.end) - Math.max(a.start, a.end);
                 }});
 
-            transitionCache.set(index, rows);
-            return rows;
+            transitionCache.set(index, transitionRows);
+            return transitionRows;
         }}
 
         function renderPoints(points, ts, force) {{
@@ -904,8 +958,10 @@ def _build_dynamic_heatmap_player_assets(map_name, frames, source_label, radius,
             for (let i = 0; i < budget; i += 1) {{
                 const row = transitionRows[i];
                 const weight = row.start + (row.end - row.start) * eased;
-                if (weight >= settings.minVisibleWeight) {{
-                    output.push([row.lat, row.lng, Math.min(Math.max(weight, 0), 1)]);
+                if (weight >= settings.transitionVisibleWeight) {{
+                    const lat = row.startLat + (row.endLat - row.startLat) * eased;
+                    const lng = row.startLng + (row.endLng - row.startLng) * eased;
+                    output.push([lat, lng, Math.min(Math.max(weight, 0), 1)]);
                 }}
             }}
 
@@ -967,12 +1023,14 @@ def _build_dynamic_heatmap_player_assets(map_name, frames, source_label, radius,
             const paintStartedAt = performance.now();
 
             if (progress >= 1) {{
+                renderInterpolated(segmentIndex, 1, ts);
                 currentFrameIndex = Math.min(segmentIndex + 1, frames.length - 1);
-                renderStaticFrame(currentFrameIndex, ts, true);
+                scrubber.value = String(currentFrameIndex);
+                updateStatus(true, ts);
                 adaptBudget(performance.now() - paintStartedAt);
                 segmentStartTs = ts;
                 if (currentFrameIndex >= frames.length - 1) {{
-                    pause(false);
+                    pause(true);
                     return;
                 }}
             }} else {{

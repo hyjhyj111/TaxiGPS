@@ -876,13 +876,11 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
         var animationFrameId = null;
         var isPlaying = false;
         var pausedVirtualElapsed = 0;
+        var playStartedAt = 0;
         var totalDurationMs = Math.max(1, {int(global_end_ms)} - {int(global_start_ms)});
         var globalStartMs = {int(global_start_ms)};
         var globalEndMs = {int(global_end_ms)};
-        var frameGapCapMs = 50;
-        var deltaSmoothingAlpha = 0.18;
         var lastFrameTimestamp = 0;
-        var smoothedDeltaMs = 16.67;
 
         var map = L.map('map', {{
             preferCanvas: true,
@@ -1070,10 +1068,10 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
                 var segment = vehicle.segments[vehicle.currentSegmentIndex];
                 var localElapsed = currentTimeMs - segment.startTimeMs;
                 var rawT = segment.durationMs > 0 ? clamp(localElapsed / segment.durationMs, 0, 1) : 1;
-                var easedT = easeInOutCubic(rawT);
+                var easedT = rawT;
                 renderLat = lerp(segment.startLat, segment.endLat, easedT);
                 renderLng = lerp(segment.startLng, segment.endLng, easedT);
-                currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh * getEasingDerivative(rawT)));
+                currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh));
                 currentStatus = segment.status === 1 ? '载客' : '空载';
                 progress = clamp((currentTimeMs - first.timeMs) / Math.max(1, last.timeMs - first.timeMs), 0, 1);
                 traveledLatLngs = vehicle.pathLatLngs.slice(0, segment.startIndex + 1).concat([[renderLat, renderLng]]);
@@ -1093,21 +1091,17 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             }}
         }}
 
+        function getVirtualElapsed(now) {{
+            if (!isPlaying) {{
+                return pausedVirtualElapsed;
+            }}
+            return (now - playStartedAt) * speedMultiplier;
+        }}
+
         function tick(currentTime) {{
             if (!isPlaying) return;
-            if (!lastFrameTimestamp) {{
-                lastFrameTimestamp = currentTime;
-            }}
-            var deltaReal = currentTime - lastFrameTimestamp;
             lastFrameTimestamp = currentTime;
-            if (!isFinite(deltaReal) || deltaReal < 0) {{
-                deltaReal = 0;
-            }}
-            var cappedDelta = clamp(deltaReal, 0, frameGapCapMs);
-            smoothedDeltaMs = smoothedDeltaMs > 0
-                ? (smoothedDeltaMs * (1 - deltaSmoothingAlpha) + cappedDelta * deltaSmoothingAlpha)
-                : cappedDelta;
-            var virtualElapsed = pausedVirtualElapsed + smoothedDeltaMs * speedMultiplier;
+            var virtualElapsed = getVirtualElapsed(currentTime);
             if (!isFinite(virtualElapsed)) {{
                 virtualElapsed = pausedVirtualElapsed;
             }}
@@ -1133,7 +1127,7 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
                 pausedVirtualElapsed = 0;
             }}
             lastFrameTimestamp = performance.now();
-            smoothedDeltaMs = 16.67;
+            playStartedAt = lastFrameTimestamp - pausedVirtualElapsed / Math.max(speedMultiplier, 0.001);
             animationFrameId = requestAnimationFrame(tick);
         }}
 
@@ -1149,16 +1143,21 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             pauseAnimation();
             pausedVirtualElapsed = 0;
             lastFrameTimestamp = 0;
-            smoothedDeltaMs = 16.67;
+            playStartedAt = 0;
             renderFleet(0);
         }}
 
         function updateSpeed() {{
             if (isPlaying) {{
-                lastFrameTimestamp = performance.now();
+                var now = performance.now();
+                pausedVirtualElapsed = clamp(getVirtualElapsed(now), 0, totalDurationMs);
+                lastFrameTimestamp = now;
             }}
             var selectedSpeed = parseFloat(document.getElementById('speedSlider').value);
             speedMultiplier = selectedSpeed * speedBaseMultiplier;
+            if (isPlaying) {{
+                playStartedAt = lastFrameTimestamp - pausedVirtualElapsed / Math.max(speedMultiplier, 0.001);
+            }}
             document.getElementById('speedValue').textContent = selectedSpeed.toFixed(1) + 'x';
             if (!isPlaying) {{
                 renderFleet(pausedVirtualElapsed);
@@ -1806,15 +1805,13 @@ def _build_animation_html(vehicle_id, df, time_scale):
         var animationFrameId = null;
         var isPlaying = false;
         var pausedVirtualElapsed = 0;
+        var playStartedAt = 0;
         var segmentIndex = 0;
         var totalDurationMs = 0;
         var segments = [];
         var pathLatLngs = [];
         var basePath = [];
-        var frameGapCapMs = 50;
-        var deltaSmoothingAlpha = 0.18;
         var lastFrameTimestamp = 0;
-        var smoothedDeltaMs = 16.67;
 
         var map = L.map('map', {{
             preferCanvas: true,
@@ -1982,11 +1979,10 @@ def _build_animation_html(vehicle_id, df, time_scale):
             var segment = segments[segmentIndex];
             var localElapsed = elapsed - segment.startTimeMs;
             var rawT = segment.durationMs > 0 ? clamp(localElapsed / segment.durationMs, 0, 1) : 1;
-            var easedT = getEasingValue(rawT);
+            var easedT = rawT;
             var lat = lerp(segment.startLat, segment.endLat, easedT);
             var lng = lerp(segment.startLng, segment.endLng, easedT);
-            var motionFactor = getEasingDerivative(rawT);
-            var currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh * motionFactor));
+            var currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh));
             var status = trajectoryData.features[segment.startIndex].properties.status;
 
             traveledLine.setLatLngs(pathLatLngs.slice(0, segment.startIndex + 1).concat([[lat, lng]]));
@@ -1994,28 +1990,20 @@ def _build_animation_html(vehicle_id, df, time_scale):
             updateInfoByPosition(lat, lng, elapsed, currentSpeed, status);
         }}
 
+        function getVirtualElapsed(now) {{
+            if (!isPlaying) {{
+                return pausedVirtualElapsed;
+            }}
+            return (now - playStartedAt) * speedMultiplier;
+        }}
+
         function tick(currentTime) {{
             if (!isPlaying) {{
                 return;
             }}
 
-            if (!lastFrameTimestamp) {{
-                lastFrameTimestamp = currentTime;
-            }}
-
-            var deltaReal = currentTime - lastFrameTimestamp;
             lastFrameTimestamp = currentTime;
-
-            if (!isFinite(deltaReal) || deltaReal < 0) {{
-                deltaReal = 0;
-            }}
-
-            var cappedDelta = clamp(deltaReal, 0, frameGapCapMs);
-            smoothedDeltaMs = smoothedDeltaMs > 0
-                ? (smoothedDeltaMs * (1 - deltaSmoothingAlpha) + cappedDelta * deltaSmoothingAlpha)
-                : cappedDelta;
-
-            var virtualElapsed = pausedVirtualElapsed + smoothedDeltaMs * speedMultiplier;
+            var virtualElapsed = getVirtualElapsed(currentTime);
             if (!isFinite(virtualElapsed)) {{
                 virtualElapsed = pausedVirtualElapsed;
             }}
@@ -2056,7 +2044,7 @@ def _build_animation_html(vehicle_id, df, time_scale):
             }}
 
             lastFrameTimestamp = performance.now();
-            smoothedDeltaMs = 16.67;
+            playStartedAt = lastFrameTimestamp - pausedVirtualElapsed / Math.max(speedMultiplier, 0.001);
             animationFrameId = requestAnimationFrame(tick);
         }}
 
@@ -2073,23 +2061,28 @@ def _build_animation_html(vehicle_id, df, time_scale):
             pausedVirtualElapsed = 0;
             segmentIndex = 0;
             lastFrameTimestamp = 0;
-            smoothedDeltaMs = 16.67;
+            playStartedAt = 0;
             if (trajectoryData.features.length > 0 && pathLatLngs.length > 0) {{
                 var first = trajectoryData.features[0];
                 var firstLatLng = pathLatLngs[0];
                 carMarker.setLatLng(firstLatLng);
                 traveledLine.setLatLngs([firstLatLng]);
-                updateInfoByPosition(firstLatLng[0], firstLatLng[1], first, 0, Number(first.properties.speed || 0));
+                updateInfoByPosition(firstLatLng[0], firstLatLng[1], 0, Number(first.properties.speed || 0), Number(first.properties.status || 0));
                 document.getElementById('progress').textContent = '0%';
             }}
         }}
 
         function updateSpeed() {{
             if (isPlaying) {{
-                lastFrameTimestamp = performance.now();
+                var now = performance.now();
+                pausedVirtualElapsed = clamp(getVirtualElapsed(now), 0, totalDurationMs);
+                lastFrameTimestamp = now;
             }}
             var selectedSpeed = parseFloat(document.getElementById('speedSlider').value);
             speedMultiplier = selectedSpeed * speedBaseMultiplier;
+            if (isPlaying) {{
+                playStartedAt = lastFrameTimestamp - pausedVirtualElapsed / Math.max(speedMultiplier, 0.001);
+            }}
             document.getElementById('speedValue').textContent = selectedSpeed.toFixed(1) + 'x';
             if (!isPlaying) {{
                 renderFrame(pausedVirtualElapsed);
