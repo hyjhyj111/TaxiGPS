@@ -52,6 +52,7 @@ ANALYSIS_CONFIG = {
     "HEATMAP_RADIUS": 18,
     "HEATMAP_BLUR": 22,
     "HEATMAP_PRECISION": 4,
+    "MAX_STATIC_HEATMAP_POINTS": 8000,
     "MAX_DYNAMIC_SLICES": 120,
     "MAX_SLICE_POINTS": 700,
     "MAX_DYNAMIC_INPUT_POINTS_MINUTE": 260,
@@ -139,6 +140,55 @@ def _clip_weights(points_df, threshold_quantile=0.92):
     return points_df, cap_value
 
 
+def _limit_static_heatmap_render_points(points_df, max_points=None):
+    if points_df is None or len(points_df) == 0:
+        return points_df, {
+            "render_heat_points": 0,
+            "render_point_limit": int(max_points or 0),
+            "render_reduction_method": "none",
+        }
+
+    limit = int(max_points or ANALYSIS_CONFIG["MAX_STATIC_HEATMAP_POINTS"])
+    if limit <= 0 or len(points_df) <= limit:
+        return points_df.copy(), {
+            "render_heat_points": int(len(points_df)),
+            "render_point_limit": limit,
+            "render_reduction_method": "none",
+        }
+
+    working = points_df.copy()
+    weight_col = "weight_scaled" if "weight_scaled" in working.columns else "weight"
+    weights = pd.to_numeric(working[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    working["_render_weight"] = weights
+    working = working.sort_values(["_render_weight", "weight"], ascending=[False, False])
+
+    hot_count = max(1, int(limit * 0.75))
+    hot_points = working.head(hot_count).copy()
+    remaining = working.iloc[hot_count:].copy()
+    sample_count = max(0, limit - len(hot_points))
+    if sample_count and len(remaining):
+        sample_weights = remaining["_render_weight"]
+        if float(sample_weights.sum()) > 0:
+            sampled = remaining.sample(n=min(sample_count, len(remaining)), weights=sample_weights, random_state=42)
+        else:
+            sampled = remaining.sample(n=min(sample_count, len(remaining)), random_state=42)
+        render_df = pd.concat([hot_points, sampled], ignore_index=True)
+    else:
+        render_df = hot_points
+
+    render_df = (
+        render_df.drop(columns=["_render_weight"], errors="ignore")
+        .sort_values(weight_col, ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
+    return render_df, {
+        "render_heat_points": int(len(render_df)),
+        "render_point_limit": limit,
+        "render_reduction_method": "hotspot_weighted_sample",
+    }
+
+
 def _enhance_dynamic_visual_weights(weight_series):
     weights = np.asarray(weight_series, dtype=float)
     weights = np.clip(weights, 0.0, 1.0)
@@ -171,7 +221,16 @@ def _normalize_display_bounds(df, lat_col="lat", lng_col="lng"):
 @lru_cache(maxsize=1)
 def _load_shenzhen_boundary_shapes():
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
-    from matplotlib.path import Path
+    try:
+        from matplotlib.path import Path
+        backend = "matplotlib"
+    except ImportError:
+        Path = None
+        backend = "shapely"
+        try:
+            from shapely.geometry import shape as shapely_shape
+        except ImportError:
+            return {"backend": "none", "polygons": [], "outer_rings": []}
 
     for path in CONFIG["BOUNDARY_PATHS"]:
         if not os.path.exists(path):
@@ -184,6 +243,13 @@ def _load_shenzhen_boundary_shapes():
         outer_rings = []
         for feature in features:
             geometry = feature.get("geometry", {})
+            if backend == "shapely":
+                try:
+                    geom = shapely_shape(geometry)
+                except Exception:
+                    geom = None
+                if geom is not None and not geom.is_empty:
+                    polygons.append(geom)
             geom_type = geometry.get("type")
             coords = geometry.get("coordinates", [])
             if geom_type == "Polygon":
@@ -196,15 +262,16 @@ def _load_shenzhen_boundary_shapes():
                 exterior = polygon[0]
                 holes = polygon[1:] if len(polygon) > 1 else []
                 outer_rings.append([[float(lat), float(lng)] for lng, lat in exterior])
-                polygons.append(
-                    {
-                        "exterior": Path(np.asarray(exterior, dtype=float)),
-                        "holes": [Path(np.asarray(hole, dtype=float)) for hole in holes if hole],
-                    }
-                )
+                if Path is not None:
+                    polygons.append(
+                        {
+                            "exterior": Path(np.asarray(exterior, dtype=float)),
+                            "holes": [Path(np.asarray(hole, dtype=float)) for hole in holes if hole],
+                        }
+                    )
         if polygons:
-            return {"polygons": polygons, "outer_rings": outer_rings}
-    return {"polygons": [], "outer_rings": []}
+            return {"backend": backend, "polygons": polygons, "outer_rings": outer_rings}
+    return {"backend": "none", "polygons": [], "outer_rings": []}
 
 
 def _filter_points_to_shenzhen_boundary(df, lat_col="lat", lng_col="lng"):
@@ -215,6 +282,24 @@ def _filter_points_to_shenzhen_boundary(df, lat_col="lat", lng_col="lng"):
     polygons = boundary.get("polygons", [])
     if not polygons:
         return df.copy(), 0
+
+    backend = boundary.get("backend", "matplotlib")
+    if backend == "shapely":
+        try:
+            from shapely import contains_xy
+        except ImportError:
+            return df.copy(), 0
+
+        lng_values = pd.to_numeric(df[lng_col], errors="coerce").to_numpy(dtype=float)
+        lat_values = pd.to_numeric(df[lat_col], errors="coerce").to_numpy(dtype=float)
+        mask = np.zeros(len(df), dtype=bool)
+        valid = np.isfinite(lng_values) & np.isfinite(lat_values)
+        for polygon in polygons:
+            current = np.zeros(len(df), dtype=bool)
+            current[valid] = contains_xy(polygon, lng_values[valid], lat_values[valid])
+            mask |= current
+        filtered = df.loc[mask].copy()
+        return filtered, int(len(df) - len(filtered))
 
     points = df[[lng_col, lat_col]].to_numpy(dtype=float)
     mask = np.zeros(len(df), dtype=bool)
@@ -1140,7 +1225,8 @@ def build_static_heatmap(
 
     heat_df, cap_value = _clip_weights(heat_df, threshold_quantile=threshold_quantile)
     m = _build_generic_map(heat_df[["lat", "lng"]].copy())
-    heat_points = heat_df[["lat", "lng", "weight_scaled"]].to_numpy().tolist()
+    render_heat_df, render_meta = _limit_static_heatmap_render_points(heat_df)
+    heat_points = render_heat_df[["lat", "lng", "weight_scaled"]].round(6).to_numpy().tolist()
 
     radius = ANALYSIS_CONFIG["HEATMAP_RADIUS"]
     HeatMap(
@@ -1188,6 +1274,9 @@ def build_static_heatmap(
             "output_path": output_path,
             "input_points": int(meta.get("filter_stats", {}).get("output_points", len(std_df))),
             "heat_points": int(len(heat_df)),
+            "render_heat_points": render_meta["render_heat_points"],
+            "render_point_limit": render_meta["render_point_limit"],
+            "render_reduction_method": render_meta["render_reduction_method"],
             "cluster_count": int(len(cluster_df)),
             "noise_count": int(len(noise_df)),
             "threshold_cap": cap_value,

@@ -1123,10 +1123,11 @@ def render_static_heatmap_tab(payload):
         st.warning("当前条件下没有可用于静态热力图的数据。")
         return
 
-    cols = st.columns(4)
+    cols = st.columns(5)
     metrics = [
         ("原始点数", info.get("input_points", 0)),
         ("聚合热力点", info.get("heat_points", 0)),
+        ("渲染点数", info.get("render_heat_points", info.get("heat_points", 0))),
         ("聚类簇数", info.get("cluster_count", 0) if request["enable_cluster"] else "未启用"),
         ("阈值上限", f"{info.get('threshold_cap', 0.0):.2f}"),
     ]
@@ -1137,7 +1138,9 @@ def render_static_heatmap_tab(payload):
     filter_stats = info.get("filter_stats", {})
     st.caption(
         f"来源标识: {info.get('source_label', '--')}；边界过滤 {filter_stats.get('bounds_removed', 0)} 点，"
-        f"漂移过滤 {filter_stats.get('drift_removed', 0)} 点，输出地图 {info.get('output_path', '--')}。"
+        f"漂移过滤 {filter_stats.get('drift_removed', 0)} 点，"
+        f"渲染策略 {info.get('render_reduction_method', 'none')} / 上限 {info.get('render_point_limit', '--')}，"
+        f"输出地图 {info.get('output_path', '--')}。"
     )
     render_html_map(html_path, height=760)
 

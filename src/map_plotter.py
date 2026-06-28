@@ -319,7 +319,58 @@ def add_map_layers(m, include_boundary=True):
     if include_boundary:
         add_shenzhen_boundary(m)
     add_click_coordinate_picker(m)
+    add_leaflet_layout_stabilizer(m)
     folium.LayerControl(collapsed=False).add_to(m)
+
+
+def add_leaflet_layout_stabilizer(m):
+    map_name = m.get_name()
+    target_bounds = getattr(m, "_taxigps_fit_bounds", None)
+    target_bounds_json = json.dumps(target_bounds, ensure_ascii=False) if target_bounds else "null"
+    stabilizer_js = f"""
+    (function __taxigpsInvalidateMapSize() {{
+        var map = window[{json.dumps(map_name)}];
+        if (!map || !map.invalidateSize) {{
+            window.setTimeout(__taxigpsInvalidateMapSize, 50);
+            return;
+        }}
+        var targetBounds = {target_bounds_json};
+        var fitCount = 0;
+        var pending = null;
+
+        function refreshLeafletLayout(reason) {{
+            if (!map || !map.invalidateSize) return;
+            map.invalidateSize({{pan: false}});
+            if (targetBounds && map.fitBounds && fitCount < 8) {{
+                map.fitBounds(targetBounds, {{padding: [20, 20], animate: false}});
+                fitCount += 1;
+            }}
+        }}
+
+        function scheduleRefresh(reason, delay) {{
+            if (pending) window.clearTimeout(pending);
+            pending = window.setTimeout(function() {{
+                pending = null;
+                refreshLeafletLayout(reason);
+            }}, delay || 0);
+        }}
+
+        [0, 80, 180, 360, 720, 1200].forEach(function(delay) {{
+            window.setTimeout(function() {{ refreshLeafletLayout('startup-' + delay); }}, delay);
+        }});
+        window.addEventListener('load', function() {{ scheduleRefresh('load', 0); }});
+        window.addEventListener('resize', function() {{ scheduleRefresh('window-resize', 80); }});
+
+        var container = map.getContainer ? map.getContainer() : null;
+        if (container && typeof ResizeObserver !== 'undefined') {{
+            var observer = new ResizeObserver(function() {{
+                scheduleRefresh('container-resize', 80);
+            }});
+            observer.observe(container);
+        }}
+    }})();
+    """
+    m.get_root().script.add_child(folium.Element(stabilizer_js))
 
 
 def add_click_coordinate_picker(m):
@@ -374,6 +425,7 @@ def build_map(df=None, zoom=None):
                 bounds = None
             if bounds is not None:
                 m.fit_bounds(bounds, padding=(20, 20))
+                m._taxigps_fit_bounds = bounds
         except Exception:
             pass
     return m
