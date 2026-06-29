@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pickle
+import hashlib
 import sys
 from functools import lru_cache
 from datetime import datetime
@@ -59,14 +60,32 @@ CONFIG = {
     "MAX_TRAJECTORY_POINTS": 1200,
     "MAX_VEHICLE_DISPLAY": 1200,
     "MAX_OD_POINTS": 1200,
+    "ROAD_CORRECTED_CACHE_DIR": "cache/road_corrected",
     "MAX_ROAD_CORRECTION_VEHICLES": 3,
     "MAX_ROAD_CORRECTION_INPUT_POINTS": 220,
+    "MAX_ROAD_CORRECTION_CACHE_POINTS": 1200,
     "MAX_CORRECTED_PATH_POINTS": 1600,
     "MAX_CONGESTION_VEHICLES": 8,
     "MAX_CONGESTION_INPUT_POINTS": 90,
     "MAX_CONGESTION_SEGMENTS": 500,
     "DEFAULT_CONGESTION_BUCKET_MINUTES": 15,
     "DEFAULT_ETA_SPEED_KMH": 28.0,
+    "BASELINE_SPEED_CACHE_PATH": "cache/edge_baseline_speed.csv",
+    "DEFAULT_HIGHWAY_SPEED_KPH": {
+        "motorway": 80.0,
+        "motorway_link": 40.0,
+        "trunk": 60.0,
+        "trunk_link": 35.0,
+        "primary": 50.0,
+        "primary_link": 30.0,
+        "secondary": 40.0,
+        "secondary_link": 25.0,
+        "tertiary": 35.0,
+        "tertiary_link": 25.0,
+        "unclassified": 30.0,
+        "residential": 25.0,
+        "living_street": 15.0,
+    },
     "ANIMATION_MIN_DELAY_MS": 80,
     "ANIMATION_MAX_DELAY_MS": 2500,
     "ANIMATION_GAP_THRESHOLD_S": 1800,
@@ -315,10 +334,11 @@ def add_shenzhen_boundary(m):
                 return
 
 
-def add_map_layers(m, include_boundary=True):
+def add_map_layers(m, include_boundary=True, include_picker=True):
     if include_boundary:
         add_shenzhen_boundary(m)
-    add_click_coordinate_picker(m)
+    if include_picker:
+        add_click_coordinate_picker(m)
     add_leaflet_layout_stabilizer(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
@@ -572,17 +592,495 @@ def _node_lat_lng(graph, node):
     return [float(lat), float(lng)]
 
 
-def _shortest_path_nodes(graph, source, target, undirected_graph=None):
+def _shortest_path_nodes(graph, source, target, undirected_graph=None, weight="length"):
     if source == target:
         return [source], "same_node"
     if nx is None:
         raise RuntimeError("路网最短路径需要安装 networkx。")
     try:
-        return nx.shortest_path(graph, source, target, weight="length"), "directed"
+        return nx.shortest_path(graph, source, target, weight=weight), "directed"
     except Exception as exc:
         if undirected_graph is None:
             raise exc
-        return nx.shortest_path(undirected_graph, source, target, weight="length"), "undirected"
+        return nx.shortest_path(undirected_graph, source, target, weight=weight), "undirected"
+
+
+def normalize_highway(value):
+    if isinstance(value, (list, tuple, set)):
+        value = next(iter(value), None)
+    return str(value or "road")
+
+
+def _coerce_edge_part(value):
+    if pd.isna(value):
+        return value
+    try:
+        numeric = float(value)
+        if numeric.is_integer():
+            return int(numeric)
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _edge_identity(u, v, key=0):
+    return (_coerce_edge_part(u), _coerce_edge_part(v), _coerce_edge_part(key))
+
+
+def _iter_graph_edges(graph):
+    if graph is None:
+        return []
+    try:
+        return graph.edges(keys=True, data=True)
+    except TypeError:
+        return ((u, v, 0, data) for u, v, data in graph.edges(data=True))
+
+
+def _graph_edge_rows(graph):
+    rows = []
+    for u, v, key, data in _iter_graph_edges(graph):
+        data = data or {}
+        rows.append(
+            {
+                "edge_u": _coerce_edge_part(u),
+                "edge_v": _coerce_edge_part(v),
+                "edge_key": _coerce_edge_part(key),
+                "length": float(data.get("length", 0.0) or 0.0),
+                "highway_type": normalize_highway(data.get("highway")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_edge_baseline_speed_cache(matched_track, graph, min_samples=3, save_path=None):
+    required = {"id", "speed", "edge_u", "edge_v", "edge_key"}
+    if matched_track is None:
+        matched_track = pd.DataFrame()
+    missing = required - set(matched_track.columns)
+    if missing:
+        raise ValueError(f"校正轨迹缺少字段: {sorted(missing)}")
+
+    track = matched_track.copy()
+    for col in ["edge_u", "edge_v", "edge_key"]:
+        track[col] = track[col].map(_coerce_edge_part)
+    track["speed"] = pd.to_numeric(track["speed"], errors="coerce")
+    valid = track[track["speed"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"])].dropna(subset=["edge_u", "edge_v", "edge_key"])
+
+    if len(valid) == 0:
+        speed_stats = pd.DataFrame(columns=["edge_u", "edge_v", "edge_key", "avg_speed", "sample_count", "vehicle_count"])
+    else:
+        speed_stats = (
+            valid.groupby(["edge_u", "edge_v", "edge_key"], as_index=False)
+            .agg(
+                avg_speed=("speed", "mean"),
+                sample_count=("speed", "size"),
+                vehicle_count=("id", pd.Series.nunique),
+            )
+            .reset_index(drop=True)
+        )
+
+    edge_info = _graph_edge_rows(graph)
+    if len(edge_info) > 0:
+        speed_stats = edge_info.merge(speed_stats, on=["edge_u", "edge_v", "edge_key"], how="left")
+    else:
+        speed_stats["length"] = np.nan
+        speed_stats["highway_type"] = "road"
+
+    speed_stats["avg_speed"] = pd.to_numeric(speed_stats.get("avg_speed"), errors="coerce")
+    speed_stats["sample_count"] = pd.to_numeric(speed_stats.get("sample_count"), errors="coerce").fillna(0).astype(int)
+    speed_stats["vehicle_count"] = pd.to_numeric(speed_stats.get("vehicle_count"), errors="coerce").fillna(0).astype(int)
+    speed_stats["highway_type"] = speed_stats["highway_type"].map(normalize_highway)
+    speed_stats["reliable"] = (speed_stats["sample_count"] >= int(min_samples)) & speed_stats["avg_speed"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"])
+    speed_stats["route_cost"] = np.where(
+        speed_stats["reliable"],
+        pd.to_numeric(speed_stats["length"], errors="coerce") / speed_stats["avg_speed"] * 3.6,
+        np.nan,
+    )
+
+    reliable = speed_stats[speed_stats["reliable"]].copy()
+    highway_median_speed = reliable.groupby("highway_type")["avg_speed"].median().dropna().to_dict()
+    meta = {
+        "success": True,
+        "edge_rows": int(len(speed_stats)),
+        "observed_edges": int((speed_stats["sample_count"] > 0).sum()),
+        "reliable_edges": int(speed_stats["reliable"].sum()),
+        "min_samples": int(min_samples),
+        "highway_median_speed": {str(k): float(v) for k, v in highway_median_speed.items()},
+        "method": "全日校正轨迹道路边平均速度；样本不足时按 highway 中位数、道路类型默认速度、全局速度回退。",
+    }
+    if save_path:
+        ensure_parent_dir(save_path)
+        speed_stats.to_csv(save_path, index=False)
+        meta["cache_path"] = save_path
+    return speed_stats, meta
+
+
+def apply_baseline_route_cost(graph, speed_stats, highway_median_speed=None, default_speed_kph=None, fallback_speed=30.0, min_samples=3):
+    if graph is None:
+        raise ValueError("路网未加载，无法写入 route_cost。")
+    highway_median_speed = highway_median_speed or {}
+    default_speed_kph = default_speed_kph or CONFIG["DEFAULT_HIGHWAY_SPEED_KPH"]
+    observed_speed = {}
+    if speed_stats is not None and len(speed_stats) > 0:
+        stats = speed_stats.copy()
+        for col in ["edge_u", "edge_v", "edge_key"]:
+            stats[col] = stats[col].map(_coerce_edge_part)
+        stats["avg_speed"] = pd.to_numeric(stats.get("avg_speed"), errors="coerce")
+        stats["sample_count"] = pd.to_numeric(stats.get("sample_count"), errors="coerce").fillna(0)
+        for row in stats.itertuples(index=False):
+            if getattr(row, "sample_count", 0) >= min_samples and pd.notna(getattr(row, "avg_speed", np.nan)):
+                speed = float(getattr(row, "avg_speed"))
+                if 1 <= speed <= CONFIG["ANIMATION_SPEED_CAP_KMH"]:
+                    observed_speed[_edge_identity(row.edge_u, row.edge_v, row.edge_key)] = speed
+
+    updated = 0
+    fallback_edges = 0
+    observed_edges = 0
+    for u, v, key, data in _iter_graph_edges(graph):
+        data = data or {}
+        edge_id = _edge_identity(u, v, key)
+        road_type = normalize_highway(data.get("highway"))
+        speed = observed_speed.get(edge_id)
+        if speed is None:
+            speed = highway_median_speed.get(road_type)
+        if speed is None:
+            speed = default_speed_kph.get(road_type)
+        if speed is None:
+            speed = float(fallback_speed)
+        speed = max(1.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], float(speed)))
+        length = float(data.get("length", 0.0) or 0.0)
+        if length <= 0:
+            point_a = _node_lat_lng(graph, u)
+            point_b = _node_lat_lng(graph, v)
+            if point_a and point_b:
+                length = max(1.0, haversine_distance(point_a[0], point_a[1], point_b[0], point_b[1]) * 1000.0)
+            else:
+                length = 1.0
+        data["baseline_speed_kph"] = speed
+        data["route_cost"] = length / speed * 3.6
+        updated += 1
+        if edge_id in observed_speed:
+            observed_edges += 1
+        else:
+            fallback_edges += 1
+    return {"updated_edges": updated, "observed_edges": observed_edges, "fallback_edges": fallback_edges}
+
+
+def _best_edge_data(graph, source, target, weight="length"):
+    edge_data = graph.get_edge_data(source, target) if hasattr(graph, "get_edge_data") else None
+    if not edge_data:
+        return None, None
+    if isinstance(edge_data, dict) and all(isinstance(value, dict) for value in edge_data.values()):
+        candidates = [(key, attrs) for key, attrs in edge_data.items() if attrs is not None]
+    else:
+        candidates = [(0, edge_data)]
+    if not candidates:
+        return None, None
+    def candidate_weight(item):
+        _, attrs = item
+        value = attrs.get(weight, attrs.get("length", 1.0))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("inf")
+    return min(candidates, key=candidate_weight)
+
+
+def _geometry_points_for_edge(graph, source, target, weight="length"):
+    _, data = _best_edge_data(graph, source, target, weight=weight)
+    if data:
+        geom = data.get("geometry")
+        if geom is not None and hasattr(geom, "coords"):
+            return [[float(lat), float(lng)] for lng, lat in geom.coords]
+    start = _node_lat_lng(graph, source)
+    end = _node_lat_lng(graph, target)
+    return [point for point in [start, end] if point]
+
+
+def _route_summary(graph, path_nodes, weight="length"):
+    points = []
+    edges = []
+    distance_m = 0.0
+    route_cost_s = 0.0
+    for idx, node in enumerate(path_nodes or []):
+        if idx == 0:
+            point = _node_lat_lng(graph, node)
+            if point:
+                points.append(point)
+            continue
+        source = path_nodes[idx - 1]
+        target = node
+        key, data = _best_edge_data(graph, source, target, weight=weight)
+        data = data or {}
+        length = float(data.get("length", 0.0) or 0.0)
+        cost = float(data.get("route_cost", length) or 0.0)
+        distance_m += length
+        route_cost_s += cost
+        edge_points = _geometry_points_for_edge(graph, source, target, weight=weight)
+        for point in edge_points:
+            if points and points[-1] == point:
+                continue
+            points.append(point)
+        edges.append(
+            {
+                "u": source,
+                "v": target,
+                "key": key,
+                "length_m": length,
+                "route_cost_s": cost,
+                "baseline_speed_kph": float(data.get("baseline_speed_kph", 0.0) or 0.0),
+                "highway": normalize_highway(data.get("highway")),
+            }
+        )
+    return {
+        "nodes": list(path_nodes or []),
+        "edges": edges,
+        "edge_count": len(edges),
+        "distance_m": float(distance_m),
+        "route_cost_s": float(route_cost_s),
+        "points": points,
+    }
+
+
+def plan_baseline_routes(graph, origin_node, dest_node):
+    if graph is None:
+        return {"success": False, "error": "路网未加载。"}
+    if nx is None:
+        return {"success": False, "error": "路线规划需要安装 networkx。"}
+    try:
+        shortest_nodes = nx.shortest_path(graph, origin_node, dest_node, weight="length")
+        fastest_nodes = nx.shortest_path(graph, origin_node, dest_node, weight="route_cost")
+    except nx.NodeNotFound as exc:
+        return {"success": False, "error": f"起终点节点不存在: {exc}"}
+    except nx.NetworkXNoPath as exc:
+        return {"success": False, "error": f"起终点之间没有可用路网路径: {exc}"}
+    return {
+        "success": True,
+        "origin_node": origin_node,
+        "dest_node": dest_node,
+        "shortest": _route_summary(graph, shortest_nodes, weight="length"),
+        "fastest": _route_summary(graph, fastest_nodes, weight="route_cost"),
+        "method": "同一路网分别使用 length 和静态 route_cost 执行 Dijkstra 路径搜索。",
+    }
+
+
+def build_baseline_speed_cache_from_vehicles(vehicle_ids, query_date=None, graph=None, network_meta=None, min_samples=3, save_path=None):
+    cleaned_vehicle_ids = []
+    for vehicle_id in vehicle_ids or []:
+        vehicle_id = str(vehicle_id).strip()
+        if vehicle_id and vehicle_id not in cleaned_vehicle_ids:
+            cleaned_vehicle_ids.append(vehicle_id)
+
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return pd.DataFrame(), {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    start_time = None
+    end_time = None
+    if query_date is not None:
+        start_time = pd.Timestamp(query_date).normalize()
+        end_time = start_time + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+    matched_frames = []
+    matching_rows = []
+    for vehicle_id in cleaned_vehicle_ids:
+        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+        if df is None or len(df) < 2:
+            matching_rows.append({"vehicle_id": vehicle_id, "success": False, "message": "全天轨迹点不足。"})
+            continue
+        df = df.copy()
+        df["vehicle_id"] = vehicle_id
+        result = approximate_hmm_match_trajectory(df, graph=graph, network_meta=network_meta)
+        meta = result["meta"]
+        matching_rows.append(
+            {
+                "vehicle_id": vehicle_id,
+                "success": bool(meta.get("success")),
+                "raw_points": meta.get("raw_points", len(df)),
+                "sampled_points": meta.get("sampled_points", 0),
+                "matched_nodes": meta.get("matched_nodes", 0),
+                "segments": meta.get("segments", 0),
+                "message": meta.get("error", "基准速度样本已生成。"),
+            }
+        )
+        segments = result.get("segments")
+        if segments is not None and len(segments) > 0:
+            track = segments.rename(
+                columns={
+                    "vehicle_id": "id",
+                    "speed_kmh": "speed",
+                }
+            )
+            matched_frames.append(track)
+
+    if matched_frames:
+        matched_track = pd.concat(matched_frames, ignore_index=True)
+    else:
+        matched_track = pd.DataFrame(columns=["id", "speed", "edge_u", "edge_v", "edge_key"])
+
+    speed_stats, meta = build_edge_baseline_speed_cache(
+        matched_track,
+        graph,
+        min_samples=min_samples,
+        save_path=save_path or CONFIG["BASELINE_SPEED_CACHE_PATH"],
+    )
+    meta.update(
+        {
+            "success": True,
+            "vehicles": len(cleaned_vehicle_ids),
+            "query_date": str(pd.Timestamp(query_date).date()) if query_date is not None else "all",
+            "matching": matching_rows,
+            "network": network_meta,
+            "track_source": "车辆缓存 + 既有近似匹配结果；未读取原始 GPS 大表。",
+        }
+    )
+    return speed_stats, meta
+
+
+def plan_baseline_routes_between_points(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids=None, query_date=None, graph=None, network_meta=None):
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    try:
+        origin_node = nearest_road_node(graph, origin_lng, origin_lat)
+        dest_node = nearest_road_node(graph, dest_lng, dest_lat)
+    except Exception as exc:
+        log.exception("基准路线起终点最近节点匹配失败")
+        return {"success": False, "error": f"起终点无法匹配到路网节点: {exc}", "network": network_meta}
+
+    speed_stats, speed_meta = build_baseline_speed_cache_from_vehicles(
+        vehicle_ids or [],
+        query_date=query_date,
+        graph=graph,
+        network_meta=network_meta,
+        save_path=CONFIG["BASELINE_SPEED_CACHE_PATH"],
+    )
+    cost_meta = apply_baseline_route_cost(graph, speed_stats, speed_meta.get("highway_median_speed", {}))
+    result = plan_baseline_routes(graph, origin_node, dest_node)
+    result.update(
+        {
+            "origin": {"lat": float(origin_lat), "lng": float(origin_lng), "node": origin_node},
+            "destination": {"lat": float(dest_lat), "lng": float(dest_lng), "node": dest_node},
+            "speed_meta": speed_meta,
+            "cost_meta": cost_meta,
+            "network": network_meta,
+        }
+    )
+    return result
+
+
+def _baseline_route_legend_html(result):
+    network_label = result.get("network", {}).get("path") or "未加载"
+    speed_meta = result.get("speed_meta", {})
+    return f"""
+    <div style="position:fixed;right:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.35);border-radius:12px;padding:12px 14px;box-shadow:0 12px 32px rgba(15,23,42,0.12);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:240px;max-width:360px;">
+      <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:6px;">最短 / 最快路线</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;"><span style="width:28px;border-top:5px solid #2563eb;"></span><span style="font-size:12px;color:#334155;">最短距离路线 length</span></div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;"><span style="width:28px;border-top:5px solid #16a34a;"></span><span style="font-size:12px;color:#334155;">基准最快路线 route_cost</span></div>
+      <div style="font-size:11px;color:#64748b;line-height:1.45;border-top:1px solid rgba(148,163,184,0.25);padding-top:8px;">路网: {network_label}<br>可靠速度边: {speed_meta.get('reliable_edges', 0)} / {speed_meta.get('edge_rows', 0)}</div>
+    </div>
+    """
+
+
+def add_dual_point_picker(m):
+    map_name = m.get_name()
+    picker_id = f"dual-route-picker-{map_name}"
+    picker_html = f"""
+    <div id="{picker_id}" style="position:fixed;left:16px;bottom:18px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:260px;">
+      <div style="font-size:12px;font-weight:700;margin-bottom:4px;">连续选点</div>
+      <div data-role="coord" style="font-size:12px;color:#475569;line-height:1.45;">依次点击起点、终点；第三次点击会重新开始。</div>
+    </div>
+    """
+    picker_js = f"""
+    (function bindDualRoutePicker() {{
+        var map = window[{json.dumps(map_name)}];
+        var panel = document.getElementById({json.dumps(picker_id)});
+        if (!map || !panel || typeof L === 'undefined') {{
+            window.setTimeout(bindDualRoutePicker, 50);
+            return;
+        }}
+        var coordNode = panel.querySelector('[data-role="coord"]');
+        var points = [];
+        var markers = [];
+        var preview = null;
+        function clearSelection() {{
+            markers.forEach(function(marker) {{ map.removeLayer(marker); }});
+            markers = [];
+            points = [];
+            if (preview) map.removeLayer(preview);
+            preview = null;
+        }}
+        map.on('click', function(e) {{
+            if (points.length === 2) clearSelection();
+            var label = points.length === 0 ? '起点' : '终点';
+            var point = {{lat: e.latlng.lat, lng: e.latlng.lng}};
+            points.push(point);
+            var marker = L.marker(e.latlng, {{title: label}}).addTo(map).bindTooltip(label).openTooltip();
+            markers.push(marker);
+            if (points.length === 1) {{
+                coordNode.innerHTML = '起点 纬度: <strong>' + point.lat.toFixed(6) + '</strong><br>起点 经度: <strong>' + point.lng.toFixed(6) + '</strong><br>继续点击终点';
+                return;
+            }}
+            preview = L.polyline([[points[0].lat, points[0].lng], [points[1].lat, points[1].lng]], {{
+                color: '#64748b',
+                weight: 3,
+                dashArray: '6,6',
+                opacity: 0.8
+            }}).addTo(map);
+            coordNode.innerHTML = '起点: ' + points[0].lat.toFixed(6) + ', ' + points[0].lng.toFixed(6) + '<br>终点: ' + points[1].lat.toFixed(6) + ', ' + points[1].lng.toFixed(6) + '<br>将坐标填入页面可重新计算路线';
+        }});
+    }})();
+    """
+    m.get_root().html.add_child(folium.Element(picker_html))
+    m.get_root().script.add_child(folium.Element(picker_js))
+
+
+def plot_baseline_route_comparison(route_result, save_path=None):
+    if not route_result or not route_result.get("success"):
+        return None
+    shortest_points = route_result.get("shortest", {}).get("points", [])
+    fastest_points = route_result.get("fastest", {}).get("points", [])
+    all_points = shortest_points + fastest_points
+    map_df = pd.DataFrame({"lati": [point[0] for point in all_points], "long": [point[1] for point in all_points]})
+    m = build_map(map_df)
+
+    if shortest_points:
+        folium.PolyLine(
+            shortest_points,
+            color="#2563eb",
+            weight=6,
+            opacity=0.86,
+            tooltip=f"最短距离路线 {route_result['shortest']['distance_m'] / 1000:.2f} km",
+        ).add_to(m)
+    if fastest_points:
+        folium.PolyLine(
+            fastest_points,
+            color="#16a34a",
+            weight=5,
+            opacity=0.9,
+            dash_array="8,6" if fastest_points == shortest_points else None,
+            tooltip=f"基准最快路线 {route_result['fastest']['route_cost_s'] / 60:.1f} min",
+        ).add_to(m)
+
+    origin = route_result.get("origin", {})
+    destination = route_result.get("destination", {})
+    if origin:
+        folium.Marker([origin["lat"], origin["lng"]], tooltip=f"起点 node={origin.get('node')}", icon=folium.Icon(color="green", icon="play")).add_to(m)
+    if destination:
+        folium.Marker([destination["lat"], destination["lng"]], tooltip=f"终点 node={destination.get('node')}", icon=folium.Icon(color="red", icon="flag")).add_to(m)
+
+    m.get_root().html.add_child(folium.Element(_baseline_route_legend_html(route_result)))
+    add_dual_point_picker(m)
+    add_map_layers(m, include_boundary=True, include_picker=False)
+    output_path = save_path or os.path.join(CONFIG["OUTPUT_MAP_DIR"], "baseline_route_comparison.html")
+    ensure_parent_dir(output_path)
+    m.save(output_path)
+    return output_path
 
 
 def _edge_length_km(graph, source, target):
@@ -621,6 +1119,175 @@ def _path_length_km(graph, path_nodes):
 
 def _segment_key(source, target):
     return f"{source}->{target}"
+
+
+def _safe_cache_token(value):
+    text = str(value or "unknown")
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+
+
+def _road_network_cache_token(network_meta=None):
+    network_meta = network_meta or {}
+    path = network_meta.get("path") or "missing-road-network"
+    version = _file_version_key(path) if path and os.path.exists(path) else "missing"
+    payload = f"road-corrected-v3-edge-geometry|{path}|{version}|{CONFIG['MAX_ROAD_CORRECTION_CACHE_POINTS']}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def road_corrected_vehicle_cache_path(vehicle_id, network_meta=None):
+    cache_dir = CONFIG["ROAD_CORRECTED_CACHE_DIR"]
+    token = _road_network_cache_token(network_meta)
+    filename = f"{_safe_cache_token(vehicle_id)}_{token}.csv"
+    return os.path.join(cache_dir, filename)
+
+
+def road_corrected_vehicle_coverage_path(vehicle_id, network_meta=None):
+    return road_corrected_vehicle_cache_path(vehicle_id, network_meta) + ".coverage.json"
+
+
+def _serialize_ts(value):
+    dt = safe_datetime(value)
+    return pd.Timestamp(dt).isoformat() if dt is not None else None
+
+
+def _read_road_cache_coverage(path):
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        intervals = payload.get("coverage", []) if isinstance(payload, dict) else []
+    except Exception:
+        log.exception("车辆路网校正缓存覆盖信息读取失败: %s", path)
+        return []
+    cleaned = []
+    for item in intervals:
+        start = safe_datetime(item.get("start")) if isinstance(item, dict) else None
+        end = safe_datetime(item.get("end")) if isinstance(item, dict) else None
+        if start is not None and end is not None and start <= end:
+            cleaned.append((pd.Timestamp(start), pd.Timestamp(end)))
+    return cleaned
+
+
+def _merge_coverage_intervals(intervals):
+    cleaned = sorted(
+        [(pd.Timestamp(start), pd.Timestamp(end)) for start, end in intervals if start is not None and end is not None and start <= end],
+        key=lambda item: item[0],
+    )
+    if not cleaned:
+        return []
+    merged = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _write_road_cache_coverage(path, intervals):
+    ensure_parent_dir(path)
+    payload = {
+        "coverage": [
+            {
+                "start": _serialize_ts(start),
+                "end": _serialize_ts(end),
+            }
+            for start, end in _merge_coverage_intervals(intervals)
+        ]
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _missing_coverage_intervals(start_time, end_time, coverage):
+    start = safe_datetime(start_time)
+    end = safe_datetime(end_time)
+    if start is None or end is None:
+        return []
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
+    if start > end:
+        return []
+    missing = []
+    cursor = start
+    for covered_start, covered_end in _merge_coverage_intervals(coverage):
+        if covered_end < cursor:
+            continue
+        if covered_start > end:
+            break
+        if covered_start > cursor:
+            missing.append((cursor, min(covered_start, end)))
+        if covered_end >= cursor:
+            cursor = max(cursor, covered_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        missing.append((cursor, end))
+    return [(item_start, item_end) for item_start, item_end in missing if item_start < item_end]
+
+
+def _corrected_rows_to_points(rows):
+    if rows is None or len(rows) == 0:
+        return []
+    if not {"matched_lat", "matched_lon"}.issubset(rows.columns):
+        return []
+    points = []
+    for _, row in rows.dropna(subset=["matched_lat", "matched_lon"]).iterrows():
+        point = [float(row["matched_lat"]), float(row["matched_lon"])]
+        if points and points[-1] == point:
+            continue
+        points.append(point)
+    return points
+
+
+def _edge_geometry_points(graph, source, target, weight="length"):
+    points = _geometry_points_for_edge(graph, source, target, weight=weight)
+    if points:
+        return points
+    start = _node_lat_lng(graph, source)
+    end = _node_lat_lng(graph, target)
+    return [point for point in [start, end] if point]
+
+
+def _normalize_corrected_cache_rows(rows, vehicle_id=None):
+    if rows is None:
+        rows = pd.DataFrame()
+    rows = rows.copy()
+    if len(rows) == 0:
+        return pd.DataFrame(
+            columns=[
+                "vehicle_id",
+                "time",
+                "status",
+                "speed",
+                "raw_lon",
+                "raw_lat",
+                "matched_lon",
+                "matched_lat",
+                "matched_node",
+                "edge_u",
+                "edge_v",
+                "edge_key",
+                "path_mode",
+                "sequence",
+            ]
+        )
+    if vehicle_id is not None:
+        rows["vehicle_id"] = str(vehicle_id)
+    if "time" in rows.columns:
+        rows["time"] = pd.to_datetime(rows["time"], errors="coerce")
+    for col in ["status", "matched_node", "edge_u", "edge_v", "edge_key", "sequence"]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    for col in ["speed", "raw_lon", "raw_lat", "matched_lon", "matched_lat"]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    if "sequence" not in rows.columns:
+        rows["sequence"] = range(len(rows))
+    rows = rows.dropna(subset=["time", "matched_lon", "matched_lat"]).sort_values(["time", "sequence"]).reset_index(drop=True)
+    return rows
 
 
 def speed_to_color(speed_kmh):
@@ -732,6 +1399,7 @@ def approximate_hmm_match_trajectory(df, graph=None, network_meta=None):
         for node_idx in range(1, len(path_nodes)):
             edge_source = path_nodes[node_idx - 1]
             edge_target = path_nodes[node_idx]
+            edge_key, _ = _best_edge_data(graph, edge_source, edge_target, weight="length")
             point_a = _node_lat_lng(graph, edge_source)
             point_b = _node_lat_lng(graph, edge_target)
             if not point_a or not point_b:
@@ -745,6 +1413,9 @@ def approximate_hmm_match_trajectory(df, graph=None, network_meta=None):
                     "time_bucket": None,
                     "vehicle_id": str(row.get("vehicle_id", "")),
                     "segment_key": _segment_key(edge_source, edge_target),
+                    "edge_u": edge_source,
+                    "edge_v": edge_target,
+                    "edge_key": 0 if edge_key is None else edge_key,
                     "source": edge_source,
                     "target": edge_target,
                     "lat1": point_a[0],
@@ -1159,7 +1830,7 @@ def plot_congestion_roads_and_eta(
     return output_path, info
 
 
-def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
+def correct_trajectory_with_road_network(df, graph=None, network_meta=None, max_points=None):
     if df is None or len(df) < 2:
         return {
             "points": [],
@@ -1184,7 +1855,8 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
             },
         }
 
-    sample_df = resample_trajectory(df, CONFIG["MAX_ROAD_CORRECTION_INPUT_POINTS"])
+    sample_limit = int(max_points or CONFIG["MAX_ROAD_CORRECTION_INPUT_POINTS"])
+    sample_df = resample_trajectory(df, sample_limit)
     matched_nodes = []
     nearest_failures = 0
     for _, row in sample_df.iterrows():
@@ -1192,9 +1864,10 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
             matched_nodes.append(nearest_road_node(graph, row["long"], row["lati"]))
         except Exception:
             nearest_failures += 1
+            matched_nodes.append(None)
             log.exception("GPS 点最近邻匹配失败: lng=%s, lat=%s", row.get("long"), row.get("lati"))
 
-    if len(matched_nodes) < 2:
+    if sum(1 for node in matched_nodes if node is not None) < 2:
         return {
             "points": [],
             "matched_nodes": matched_nodes,
@@ -1211,10 +1884,15 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
     path_failures = 0
     undirected_segments = 0
     same_node_segments = 0
+    path_rows = []
+    sequence = 0
 
     for idx in range(1, len(matched_nodes)):
         source = matched_nodes[idx - 1]
         target = matched_nodes[idx]
+        if source is None or target is None:
+            continue
+        row = sample_df.iloc[idx]
         if undirected_graph is None and source != target and hasattr(graph, "is_directed") and graph.is_directed():
             try:
                 undirected_graph = graph.to_undirected(as_view=True)
@@ -1235,13 +1913,49 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
                     corrected_points.append(fallback)
             continue
 
-        for node in path_nodes:
-            point = _node_lat_lng(graph, node)
-            if not point:
-                continue
-            if corrected_points and corrected_points[-1] == point:
-                continue
-            corrected_points.append(point)
+        if len(path_nodes) == 1:
+            point = _node_lat_lng(graph, path_nodes[0])
+            edge_points = [point] if point else []
+            edge_source = path_nodes[0]
+            edge_target = path_nodes[0]
+            edge_key = 0
+            edge_node = path_nodes[0]
+            edge_items = [(edge_source, edge_target, edge_key, edge_node, edge_points)]
+        else:
+            edge_items = []
+            for node_idx in range(1, len(path_nodes)):
+                edge_source = path_nodes[node_idx - 1]
+                edge_target = path_nodes[node_idx]
+                edge_key, _ = _best_edge_data(graph, edge_source, edge_target, weight="length")
+                edge_key = 0 if edge_key is None else edge_key
+                edge_items.append((edge_source, edge_target, edge_key, edge_target, _edge_geometry_points(graph, edge_source, edge_target, weight="length")))
+
+        for edge_source, edge_target, edge_key, edge_node, edge_points in edge_items:
+            for point in edge_points:
+                if not point:
+                    continue
+                if corrected_points and corrected_points[-1] == point:
+                    continue
+                corrected_points.append(point)
+                path_rows.append(
+                    {
+                        "vehicle_id": str(row.get("vehicle_id", row.get("id", ""))),
+                        "time": row["time"],
+                        "status": int(row.get("status", 0) or 0),
+                        "speed": float(row.get("speed", 0.0) or 0.0),
+                        "raw_lon": float(row.get("long", np.nan)),
+                        "raw_lat": float(row.get("lati", np.nan)),
+                        "matched_lon": point[1],
+                        "matched_lat": point[0],
+                        "matched_node": edge_node,
+                        "edge_u": edge_source,
+                        "edge_v": edge_target,
+                        "edge_key": edge_key,
+                        "path_mode": mode,
+                        "sequence": sequence,
+                    }
+                )
+                sequence += 1
 
     if len(corrected_points) > CONFIG["MAX_CORRECTED_PATH_POINTS"]:
         idx = np.linspace(0, len(corrected_points) - 1, num=CONFIG["MAX_CORRECTED_PATH_POINTS"], dtype=int)
@@ -1252,7 +1966,7 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
         "success": success,
         "raw_points": len(df),
         "sampled_points": len(sample_df),
-        "matched_nodes": len(matched_nodes),
+        "matched_nodes": sum(1 for node in matched_nodes if node is not None),
         "corrected_points": len(corrected_points),
         "nearest_failures": nearest_failures,
         "path_failures": path_failures,
@@ -1272,7 +1986,166 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None):
         path_failures,
         undirected_segments,
     )
-    return {"points": corrected_points, "matched_nodes": matched_nodes, "meta": meta}
+    return {"points": corrected_points, "matched_nodes": matched_nodes, "path_rows": pd.DataFrame(path_rows), "meta": meta}
+
+
+def load_or_build_road_corrected_vehicle_cache(vehicle_id, start_time=None, end_time=None, graph=None, network_meta=None, force_rebuild=False):
+    vehicle_id = str(vehicle_id).strip()
+    if not vehicle_id:
+        return {"rows": pd.DataFrame(), "points": [], "meta": {"success": False, "error": "未提供车辆ID。"}}
+    if graph is None:
+        graph, network_meta = load_road_network()
+    network_meta = network_meta or {}
+    if graph is None:
+        return {
+            "rows": pd.DataFrame(),
+            "points": [],
+            "meta": {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta},
+        }
+
+    cache_path = road_corrected_vehicle_cache_path(vehicle_id, network_meta)
+    coverage_path = road_corrected_vehicle_coverage_path(vehicle_id, network_meta)
+    cached_rows = pd.DataFrame()
+    coverage = [] if force_rebuild else _read_road_cache_coverage(coverage_path)
+    if not force_rebuild and os.path.exists(cache_path):
+        try:
+            cached_rows = _normalize_corrected_cache_rows(pd.read_csv(cache_path), vehicle_id=vehicle_id)
+        except Exception:
+            log.exception("车辆路网校正缓存读取失败，将重新生成: %s", cache_path)
+            cached_rows = pd.DataFrame()
+            coverage = []
+
+    query_start = safe_datetime(start_time)
+    query_end = safe_datetime(end_time)
+    missing_intervals = _missing_coverage_intervals(query_start, query_end, coverage)
+    if query_start is None or query_end is None:
+        if os.path.exists(cache_path) and len(cached_rows) > 0 and not force_rebuild:
+            missing_intervals = []
+        else:
+            df_all = load_vehicle_trajectory(vehicle_id, None, None)
+            if df_all is not None and len(df_all) > 0:
+                query_start = df_all["time"].min()
+                query_end = df_all["time"].max()
+                missing_intervals = [(pd.Timestamp(query_start), pd.Timestamp(query_end))]
+
+    new_frames = []
+    processed_intervals = []
+    skipped_intervals = []
+    for interval_start, interval_end in missing_intervals:
+        df = load_vehicle_trajectory(vehicle_id, interval_start, interval_end)
+        if df is None or len(df) < 2:
+            skipped_intervals.append((interval_start, interval_end))
+            processed_intervals.append((interval_start, interval_end))
+            continue
+        cache_df = resample_trajectory(df, CONFIG["MAX_ROAD_CORRECTION_CACHE_POINTS"])
+        cache_df = cache_df.copy()
+        cache_df["vehicle_id"] = vehicle_id
+        result = correct_trajectory_with_road_network(
+            cache_df,
+            graph=graph,
+            network_meta=network_meta,
+            max_points=CONFIG["MAX_ROAD_CORRECTION_CACHE_POINTS"],
+        )
+        rows = _normalize_corrected_cache_rows(result.get("path_rows"), vehicle_id=vehicle_id)
+        if len(rows) > 0:
+            new_frames.append(rows)
+        processed_intervals.append((interval_start, interval_end))
+
+    if new_frames:
+        combined_rows = pd.concat([cached_rows] + new_frames, ignore_index=True) if len(cached_rows) > 0 else pd.concat(new_frames, ignore_index=True)
+        combined_rows = _normalize_corrected_cache_rows(combined_rows, vehicle_id=vehicle_id)
+        dedupe_cols = [
+            col
+            for col in ["vehicle_id", "time", "matched_lon", "matched_lat", "matched_node", "edge_u", "edge_v", "edge_key", "path_mode"]
+            if col in combined_rows.columns
+        ]
+        if dedupe_cols:
+            combined_rows = combined_rows.drop_duplicates(subset=dedupe_cols).reset_index(drop=True)
+        combined_rows["sequence"] = range(len(combined_rows))
+        ensure_parent_dir(cache_path)
+        combined_rows.to_csv(cache_path, index=False)
+        cached_rows = combined_rows
+    elif len(cached_rows) == 0 and processed_intervals:
+        ensure_parent_dir(cache_path)
+        _normalize_corrected_cache_rows(pd.DataFrame(), vehicle_id=vehicle_id).to_csv(cache_path, index=False)
+
+    if processed_intervals:
+        coverage = _merge_coverage_intervals(list(coverage) + processed_intervals)
+        _write_road_cache_coverage(coverage_path, coverage)
+
+    rows = slice_road_corrected_rows(cached_rows, start_time=query_start, end_time=query_end)
+    points = _corrected_rows_to_points(rows)
+    cache_hit = len(missing_intervals) == 0 and len(cached_rows) > 0
+    if len(points) < 2 and len(cached_rows) == 0 and not processed_intervals:
+        return {
+            "rows": pd.DataFrame(),
+            "points": [],
+            "meta": {"success": False, "cache_hit": False, "cache_path": cache_path, "coverage_path": coverage_path, "error": "车辆缓存轨迹点不足，无法生成路网校正缓存。"},
+        }
+    meta = {
+        "success": len(points) >= 2,
+        "cache_hit": cache_hit,
+        "cache_path": cache_path,
+        "coverage_path": coverage_path,
+        "cache_rows": len(cached_rows),
+        "corrected_points": len(points),
+        "processed_intervals": len(processed_intervals),
+        "skipped_intervals": len(skipped_intervals),
+        "coverage": [{"start": _serialize_ts(start), "end": _serialize_ts(end)} for start, end in _merge_coverage_intervals(coverage)],
+        "network": network_meta,
+        "message": "已读取查询缓存。" if cache_hit else "已补齐查询缺失区间并更新缓存。",
+    }
+    if len(points) < 2:
+        meta.setdefault("error", "当前查询区间的车辆路网校正缓存没有足够点位可显示。")
+    log.info(
+        "车辆路网校正查询缓存完成: vehicle_id=%s, cache_hit=%s, processed=%s, rows=%s, cache=%s",
+        vehicle_id,
+        cache_hit,
+        len(processed_intervals),
+        len(cached_rows),
+        cache_path,
+    )
+    return {"rows": rows, "points": points, "meta": meta}
+
+
+def slice_road_corrected_rows(rows, start_time=None, end_time=None):
+    rows = _normalize_corrected_cache_rows(rows)
+    if len(rows) == 0:
+        return rows
+    start_dt = safe_datetime(start_time)
+    end_dt = safe_datetime(end_time)
+    if start_dt is not None:
+        rows = rows[rows["time"] >= start_dt]
+    if end_dt is not None:
+        rows = rows[rows["time"] <= end_dt]
+    return rows.sort_values(["time", "sequence"]).reset_index(drop=True)
+
+
+def load_road_corrected_vehicle_slice(vehicle_id, start_time=None, end_time=None, graph=None, network_meta=None, force_rebuild=False):
+    cached = load_or_build_road_corrected_vehicle_cache(
+        vehicle_id,
+        start_time=start_time,
+        end_time=end_time,
+        graph=graph,
+        network_meta=network_meta,
+        force_rebuild=force_rebuild,
+    )
+    rows = slice_road_corrected_rows(cached.get("rows"), start_time=start_time, end_time=end_time)
+    points = _corrected_rows_to_points(rows)
+    if len(points) > CONFIG["MAX_CORRECTED_PATH_POINTS"]:
+        idx = np.linspace(0, len(points) - 1, num=CONFIG["MAX_CORRECTED_PATH_POINTS"], dtype=int)
+        points = [points[i] for i in idx]
+    meta = dict(cached.get("meta", {}))
+    meta.update(
+        {
+            "window_rows": len(rows),
+            "window_corrected_points": len(points),
+            "success": len(points) >= 2,
+        }
+    )
+    if len(points) < 2:
+        meta.setdefault("error", "当前时间窗口内的车辆路网校正缓存点不足。")
+    return {"rows": rows, "points": points, "meta": meta}
 
 
 def _trajectory_segment_rows(df):
@@ -2315,7 +3188,13 @@ def plot_road_corrected_trajectories(vehicle_ids, start_time=None, end_time=None
             )
             continue
 
-        result = correct_trajectory_with_road_network(df, graph=graph, network_meta=network_meta)
+        result = load_road_corrected_vehicle_slice(
+            vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
+            graph=graph,
+            network_meta=network_meta,
+        )
         meta = result["meta"]
         corrected_points = result["points"]
         corrections.append(
@@ -2324,12 +3203,18 @@ def plot_road_corrected_trajectories(vehicle_ids, start_time=None, end_time=None
                 "success": bool(meta.get("success")),
                 "raw_points": meta.get("raw_points", len(df)),
                 "sampled_points": meta.get("sampled_points", 0),
-                "corrected_points": meta.get("corrected_points", len(corrected_points)),
+                "cache_hit": bool(meta.get("cache_hit")),
+                "cache_rows": meta.get("cache_rows", 0),
+                "window_rows": meta.get("window_rows", len(corrected_points)),
+                "processed_intervals": meta.get("processed_intervals", 0),
+                "corrected_points": meta.get("window_corrected_points", len(corrected_points)),
                 "matched_nodes": meta.get("matched_nodes", 0),
                 "path_failures": meta.get("path_failures", 0),
                 "nearest_failures": meta.get("nearest_failures", 0),
                 "undirected_segments": meta.get("undirected_segments", 0),
-                "message": meta.get("error", "校正完成。"),
+                "cache_path": meta.get("cache_path", ""),
+                "coverage_path": meta.get("coverage_path", ""),
+                "message": meta.get("error") or meta.get("message", "校正完成。"),
             }
         )
         if len(corrected_points) >= 2:
