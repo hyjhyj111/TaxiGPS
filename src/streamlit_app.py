@@ -59,6 +59,54 @@ logger = logging.getLogger(__name__)
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
 VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "路线规划", "拥堵与ETA"]
+NAVIGATION_GROUPS = [
+    {
+        "label": "地图",
+        "items": [
+            {"view": "轨迹查询", "icon": "📍"},
+            {"view": "动画轨迹", "icon": "▶️"},
+            {"view": "分钟位置", "icon": "⏱️"},
+            {"view": "OD点标注", "icon": "🔵"},
+        ],
+        "divider_after": True,
+    },
+    {
+        "label": "分析",
+        "items": [
+            {"view": "热力图与统计分析", "icon": "🔥"},
+        ],
+        "divider_after": True,
+    },
+    {
+        "label": "路线",
+        "items": [
+            {"view": "路线规划", "icon": "🗺️"},
+            {"view": "拥堵与ETA", "icon": "🚗"},
+        ],
+        "divider_after": False,
+    },
+]
+
+
+def get_view_context(view_name):
+    """Return the group label and description for a given view name."""
+    for group in NAVIGATION_GROUPS:
+        for item in group["items"]:
+            if item["view"] == view_name:
+                descriptions = {
+                    "轨迹查询": "按车辆ID和时间范围查询行驶轨迹",
+                    "动画轨迹": "按时间顺序播放车辆运动轨迹",
+                    "分钟位置": "查看指定分钟的车辙分布",
+                    "OD点标注": "展示上车点和下车点位置",
+                    "热力图与统计分析": "静态/动态热力图、聚类与订单统计",
+                    "路线规划": "最短距离与基准最快路线规划",
+                    "拥堵与ETA": "路段拥堵颜色与历史均速ETA",
+                }
+                return {
+                    "group": group["label"],
+                    "description": descriptions.get(view_name, ""),
+                }
+    return {"group": "", "description": ""}
 
 
 DEFAULTS = {
@@ -126,153 +174,100 @@ def init_page():
         initial_sidebar_state="expanded",
     )
     st.markdown(
-        """
-        <style>
-        :root {
-            --bg: #ffffff;
-            --surface: #f5f5f5;
-            --surface-2: #fafafa;
-            --border: #e0e0e0;
-            --border-strong: #cfcfcf;
-            --text: #212121;
-            --muted: #616161;
-            --soft: #9e9e9e;
+       """
+       <style>
+       :root {
+           --bg: #ffffff;
+           --surface: #f5f5f5;
+           --surface-2: #fafafa;
+           --border: #e0e0e0;
+           --border-strong: #cfcfcf;
+           --text: #212121;
+           --muted: #616161;
+           --soft: #9e9e9e;
+            --accent: #2563eb;
+            --accent-light: #dbeafe;
+            --accent-soft: #eff6ff;
+       }
+
+       .stApp {
+           background: var(--bg);
+           color: var(--text);
+           font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       }
+
+       .block-container {
+            padding-top: 0.6rem;
+            padding-bottom: 0.6rem;
+            max-width: 100% !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+       }
+
+       [data-testid="stSidebar"] {
+            background: #f8f9fb;
+            border-right: 1px solid #e5e7eb;
+            min-width: 260px !important;
+            max-width: 300px !important;
         }
 
-        .stApp {
-            background: var(--bg);
+
+
+/* ─── Query Controls ─── */
+
+
+        /* Hide Streamlit page header to prevent content overlap */
+        header[data-testid="stHeader"] {
+            display: none;
+        }
+
+        /* ─── Main Content: Map Focus ─── */
+        .main-map-area {
+            width: 100%;
+        }
+
+        .main-map-area iframe {
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        }
+
+        /* ─── Feature Controls ─── */
+        .feature-header {
+            font-size: 1.1rem;
+            font-weight: 600;
             color: var(--text);
-            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            margin-bottom: 0.75rem;
         }
 
-        .block-container {
-            padding-top: 1.1rem;
-            padding-bottom: 1.2rem;
+        .feature-controls {
+            background: #f8f9fb;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.75rem;
         }
 
-        [data-testid="stSidebar"] {
-            background: #fafafa;
-            border-right: 1px solid var(--border);
+        .feature-controls .stButton button {
+            border-radius: 8px !important;
+            font-size: 0.85rem !important;
         }
 
-        [data-testid="stSidebar"] * {
-            color: var(--text) !important;
-        }
-
-        [data-testid="stSidebar"] .stTextInput input,
-        [data-testid="stSidebar"] .stNumberInput input,
-        [data-testid="stSidebar"] .stDateInput input,
-        [data-testid="stSidebar"] .stTextInput input,
-        [data-testid="stSidebar"] .stSelectbox div,
-        [data-testid="stSidebar"] .stSlider {
-            background: #ffffff !important;
-        }
-
-        [data-testid="stSidebar"] .stNumberInput input {
-            color: var(--text) !important;
-            text-align: center;
-            font-variant-numeric: tabular-nums;
-        }
-
-        .stTextInput input,
-        .stNumberInput input,
-        .stDateInput input,
-        .stTimeInput input {
-            border: 1px solid var(--border) !important;
-            border-radius: 10px !important;
-        }
-
-        [data-testid="stSidebar"] .stTimeInput input {
-            color: var(--text) !important;
-            text-align: center;
-            font-variant-numeric: tabular-nums;
-        }
-
-        [data-testid="stSidebar"] .stTextInput input {
-            color: var(--text) !important;
-            text-align: center;
-            font-variant-numeric: tabular-nums;
-        }
-
-        .hero {
-            background: #ffffff;
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 22px 22px 18px 22px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
-            margin-bottom: 1rem;
-        }
-
-        .hero h1 {
-            margin: 0 0 0.35rem 0;
-            font-size: 1.8rem;
-            line-height: 1.15;
-            color: var(--text);
-        }
-
-        .hero p {
-            margin: 0;
-            color: var(--muted);
-            max-width: 62rem;
-        }
-
-        .summary-grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 12px;
-            margin: 0.75rem 0 1rem 0;
-        }
-
-        .summary-card {
-            background: var(--surface-2);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 14px 16px;
-        }
-
-        .summary-card .label {
-            font-size: 0.82rem;
-            color: var(--muted);
-            margin-bottom: 0.25rem;
-        }
-
-        .summary-card .value {
-            font-size: 1.06rem;
-            font-weight: 700;
-            color: var(--text);
-            overflow-wrap: anywhere;
-        }
-
-        .subtle-panel {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 14px 16px;
-        }
-
-        .stRadio > div {
-            gap: 0.35rem;
-        }
-
-        .stRadio label {
-            border: 1px solid var(--border) !important;
-            border-radius: 999px !important;
-            padding: 0.45rem 0.85rem !important;
-            background: #ffffff !important;
-        }
-
-        .stRadio label[data-checked="true"] {
-            background: #f0f0f0 !important;
-            border-color: var(--border-strong) !important;
-        }
-
-        hr {
-            border-color: var(--border);
+        /* ─── Responsive ─── */
+        @media (max-width: 768px) {
+            [data-testid="stSidebar"] {
+                min-width: 100% !important;
+                max-width: 100% !important;
+            }
+            .block-container {
+                padding-left: 0.5rem !important;
+                padding-right: 0.5rem !important;
+            }
         }
         </style>
         """,
-        unsafe_allow_html=True,
-    )
+       unsafe_allow_html=True,
+   )
 
 
 def init_state():
@@ -553,10 +548,26 @@ def validate_payload(payload):
     return errors
 
 
-def sidebar_form():
-    st.sidebar.markdown("### 查询控制台")
-    with st.sidebar.form("query_form", clear_on_submit=False):
-        st.date_input("日期", key="query_date")
+def render_sidebar():
+    """Render vertical navigation menu + compact query controls in sidebar."""
+    with st.sidebar:
+        # ── App Title ──
+        st.markdown("🚕 **GPS轨迹系统**")
+        st.markdown("---")
+
+        active_view = st.radio(
+            "功能选择",
+            VIEW_OPTIONS,
+            index=VIEW_OPTIONS.index(st.session_state.get("active_view", "轨迹查询")),
+            key="nav_radio",
+            label_visibility="collapsed",
+        )
+
+        if active_view != st.session_state.get("active_view"):
+            st.session_state["active_view"] = active_view
+            st.rerun()
+
+        st.markdown("**查询条件**")
 
         available_vehicle_ids = get_available_vehicle_ids()
         current_trajectory_ids = [
@@ -567,61 +578,43 @@ def sidebar_form():
         if current_trajectory_ids != st.session_state.get("trajectory_vehicle_ids", []):
             st.session_state["trajectory_vehicle_ids"] = current_trajectory_ids
 
+        st.date_input("日期", key="query_date", label_visibility="collapsed")
+
         st.multiselect(
             "车辆ID",
             options=available_vehicle_ids,
             key="trajectory_vehicle_ids",
             help="最多同时支持10车查询",
+            placeholder="选择车辆ID",
         )
 
-        st.markdown("#### 轨迹区间")
-        st.text_input("开始时间", key="start_time_of_day", placeholder="08:00")
-        st.text_input("结束时间", key="end_time_of_day", placeholder="10:00")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("开始", key="start_time_of_day", placeholder="08:00", label_visibility="collapsed")
+        with c2:
+            st.text_input("结束", key="end_time_of_day", placeholder="10:00", label_visibility="collapsed")
 
-        st.markdown("#### 分钟查询")
-        st.text_input("查询时间", key="minute_time_of_day", placeholder="09:30")
+        st.text_input("分钟查询", key="minute_time_of_day", placeholder="09:30", label_visibility="collapsed")
 
-        st.markdown("#### ETA 预留坐标")
-        c3, c4 = st.columns(2)
-        with c3:
-            st.number_input("参考纬度", format="%.6f", key="ref_lat")
-        with c4:
-            st.number_input("参考经度", format="%.6f", key="ref_lng")
 
-        submitted = st.form_submit_button("执行查询", use_container_width=True, type="primary")
+        query_cols = st.columns(2)
+        with query_cols[0]:
+            submitted = st.button("执行查询", use_container_width=True, type="primary")
+        with query_cols[1]:
+            if st.button("重置", use_container_width=True):
+                reset_to_defaults()
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 系统说明")
-    st.sidebar.markdown(
-        """
-        - 轨迹查询：读取车辆缓存，展示指定时间范围内的行驶轨迹
-        - 分钟位置：读取分钟缓存，查看某一分钟的车辆分布
-        - OD 点标注：展示上车点和下车点，并自动区分线路
-        - 动画轨迹：在动画页面中按时间顺序播放单车运动，并显示速度变化
-        - 热力图与统计分析：新增静态/动态热力图、订单统计、车辆运营统计与上车点聚类分析
-        - 拥堵与ETA：按路网匹配路段统计速度颜色，并用路网距离和历史均速估算到达时间
-        """
-    )
+        st.markdown(
+            '<div style="padding:0.3rem 0.5rem;">'
+            '<span style="font-size:0.75rem;color:#9ca3af;">清空缓存</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.sidebar.button("清空缓存", key="clear_cache_btn", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
-    st.sidebar.markdown("---")
-    if st.sidebar.button("重置为默认值", use_container_width=True):
-        reset_to_defaults()
-    if st.sidebar.button("清空缓存", use_container_width=True):
-        st.cache_data.clear()
-        st.success("缓存已清空")
     return submitted
-
-
-def render_header():
-    st.markdown(
-        """
-        <div class="hero">
-          <h1>出租车GPS轨迹查询系统</h1>
-          <p>面向出租车 GPS 数据的统一查询控制台。系统基于车辆缓存、分钟缓存与 OD 结果表提供轨迹检索、分钟位置、上下车点标注和单车动画展示，页面保持简洁、清晰且响应迅速。</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_summary(payload):
@@ -646,7 +639,7 @@ def render_summary(payload):
     ]
     for col, (label, value) in zip(cols, cards):
         with col:
-            st.markdown(
+             st.markdown(
                 f"""
                 <div class="summary-card">
                   <div class="label">{label}</div>
@@ -660,7 +653,6 @@ def render_summary(payload):
 
 def render_html_map(html_path, height=700, loading_message="加载中..."):
     if html_path and os.path.exists(html_path):
-        st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
         with open(html_path, "r", encoding="utf-8") as f:
             html_content = f.read()
         st.components.v1.html(html_content, height=height, scrolling=True)
@@ -1702,8 +1694,7 @@ def main():
 
         st.session_state.setdefault("last_query", build_query_payload())
 
-        render_header()
-        submitted = sidebar_form()
+        submitted = render_sidebar()
 
         payload = build_query_payload()
         if submitted:
@@ -1721,16 +1712,7 @@ def main():
             st.success("查询条件已更新。")
 
         active_payload = st.session_state.get("last_query") or payload
-        render_summary(active_payload)
-        render_query_status(active_payload)
-
-        active_view = st.radio(
-            "功能切换",
-            VIEW_OPTIONS,
-            horizontal=True,
-            key="active_view",
-            label_visibility="collapsed",
-        )
+        active_view = st.session_state.get("active_view", "轨迹查询")
 
         previous_active_view = st.session_state.get("last_active_view")
         if active_view == "热力图与统计分析" and previous_active_view != "热力图与统计分析":
@@ -1752,8 +1734,6 @@ def main():
         elif active_view == "拥堵与ETA":
             render_congestion_eta_view(active_payload)
 
-        st.markdown("---")
-        st.caption("数据来源: cache/vehicles/ | cache/minutes/ | data/processed/od_table.csv | exports/heatmap_stats/")
     except Exception:
         logger.exception("页面主流程错误")
         st.error("页面加载失败，请稍后重试。")
