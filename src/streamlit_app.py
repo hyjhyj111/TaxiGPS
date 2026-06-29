@@ -542,8 +542,8 @@ def validate_payload(payload):
     if payload["start_time"] >= payload["end_time"]:
         errors.append("开始时间必须早于结束时间。")
 
-    if payload["time_scale"] <= 0:
-        errors.append("动画速度必须大于 0。")
+    if payload["time_scale"] < 1 or payload["time_scale"] > 5:
+        errors.append("动画倍速必须在 1-5 倍之间。")
 
     return errors
 
@@ -794,63 +794,13 @@ def render_trajectory_view(payload):
             st.warning("未找到符合条件的轨迹数据。")
             return
 
-        combined_df = pd.concat([df.assign(vehicle_id=vehicle_id) for vehicle_id, df in trajectory_frames], ignore_index=True)
-        cols = st.columns(4)
-        metrics = [
-            ("车辆数", len(trajectory_frames)),
-            ("轨迹点", len(combined_df)),
-            ("载客点", int((combined_df["status"] == 1).sum())),
-            ("空载点", int((combined_df["status"] == 0).sum())),
-        ]
-        for col, (label, value) in zip(cols, metrics):
-            with col:
-                st.metric(label, value)
-
-        st.caption("轨迹颜色区分车辆，线型区分状态：实线表示载客，虚线表示空载。")
-        render_vehicle_status_panel(trajectory_frames)
         if enable_road_correction:
-            html_path, info = plot_road_corrected_trajectories(
+            html_path, _info = plot_road_corrected_trajectories(
                 [vehicle_id for vehicle_id, _ in trajectory_frames],
                 payload["start_time"],
                 payload["end_time"],
                 enable_correction=True,
             )
-            network_meta = info.get("network", {}) if info else {}
-            if network_meta.get("path"):
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("路网节点", network_meta.get("node_count", 0))
-                with c2:
-                    st.metric("路网边", network_meta.get("edge_count", 0))
-                with c3:
-                    st.metric("校正成功车辆", info.get("successful_corrections", 0))
-                with c4:
-                    st.metric("加载耗时", f"{network_meta.get('load_seconds', 0):.2f}s")
-            if info and info.get("corrections"):
-                correction_df = pd.DataFrame(info["corrections"])
-                display_cols = [
-                    col
-                    for col in [
-                        "vehicle_id",
-                        "success",
-                        "raw_points",
-                        "sampled_points",
-                        "cache_hit",
-                        "cache_rows",
-                        "window_rows",
-                        "processed_intervals",
-                        "matched_nodes",
-                        "corrected_points",
-                        "nearest_failures",
-                        "path_failures",
-                        "undirected_segments",
-                        "cache_path",
-                        "coverage_path",
-                        "message",
-                    ]
-                    if col in correction_df.columns
-                ]
-                st.dataframe(correction_df[display_cols], use_container_width=True, hide_index=True)
             render_html_map(html_path, height=760)
         elif len(trajectory_frames) == 1:
             render_html_map(
@@ -875,7 +825,6 @@ def render_minute_view(payload):
         if df is None or len(df) == 0:
             st.warning("该分钟没有车辆数据。")
             return
-        st.caption("点击地图上的车辆点，可展开查看该车后续轨迹。")
 
         display_df = df
         selected_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
@@ -891,25 +840,11 @@ def render_minute_view(payload):
                             f"至 {time_range['max_time'].strftime('%Y-%m-%d %H:%M:%S')}，可尝试调整分钟查询。"
                         )
                     return
-                st.caption(f"当前仅显示车辆 {selected_vehicle_ids[0]} 的分钟位置。")
             else:
                 display_df = df[df["vehicle_id"].isin(selected_vehicle_ids)]
                 if len(display_df) == 0:
                     st.warning("所选车辆在该分钟没有位置数据。")
                     return
-                st.caption(f"当前显示所选 {len(selected_vehicle_ids)} 辆车的分钟位置。")
-        else:
-            st.caption("当前显示所有车辆的分钟位置，系统会自动按上限抽样以提升流畅度。")
-
-        cols = st.columns(3)
-        minute_metrics = [
-            ("车辆总数", len(display_df)),
-            ("载客车辆", int((display_df["status"] == 1).sum())),
-            ("空载车辆", int((display_df["status"] == 0).sum())),
-        ]
-        for col, (label, value) in zip(cols, minute_metrics):
-            with col:
-                st.metric(label, value)
 
         render_html_map(
             plot_minute_vehicles(
@@ -945,18 +880,6 @@ def render_od_view(payload):
                 st.warning("当前时间范围内未找到 OD 数据。")
             return
 
-        cols = st.columns(4)
-        metrics = [
-            ("OD 订单数", len(df)),
-            ("总行驶距离", f"{df['OD_Dist_km'].sum():.1f} km"),
-            ("平均距离", f"{df['OD_Dist_km'].mean():.2f} km"),
-            ("平均时长", f"{df['OD_Time_s'].mean():.0f} 秒"),
-        ]
-        for col, (label, value) in zip(cols, metrics):
-            with col:
-                st.metric(label, value)
-
-        st.caption("绿色为上车点，红色为下车点。点较多时会自动聚类并抽样连线。")
         render_html_map(
             plot_od_points(
                 payload["start_time"],
@@ -995,16 +918,7 @@ def render_animation_view(payload):
             st.warning("轨迹点不足，无法生成动画。")
             return
 
-        combined_df = pd.concat([df.assign(vehicle_id=vehicle_id) for vehicle_id, df in animation_frames], ignore_index=True)
-        st.caption("动画采用逐帧插值播放，并根据相邻轨迹点的时间差模拟速度变化。")
         if len(animation_frames) == 1:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("轨迹点", len(combined_df))
-            with c2:
-                st.metric("时间跨度", f"{(combined_df.iloc[-1]['time'] - combined_df.iloc[0]['time']).total_seconds() / 60:.0f} 分钟")
-            with c3:
-                st.metric("平均速度", f"{combined_df['speed'].mean():.1f} km/h")
             render_html_map(
                 plot_animated_trajectory(
                     animation_frames[0][0],
@@ -1015,15 +929,6 @@ def render_animation_view(payload):
                 height=840,
             )
         else:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("车辆数", len(animation_frames))
-            with c2:
-                st.metric("轨迹点", len(combined_df))
-            with c3:
-                st.metric("平均速度", f"{combined_df['speed'].mean():.1f} km/h")
-            with c4:
-                st.metric("时间跨度", f"{(combined_df['time'].max() - combined_df['time'].min()).total_seconds() / 60:.0f} 分钟")
             render_html_map(
                 plot_multi_vehicle_animated_trajectory(
                     [vehicle_id for vehicle_id, _ in animation_frames],

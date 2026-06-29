@@ -1,6 +1,8 @@
 import os
+import inspect
 import sys
 import unittest
+from datetime import datetime
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +47,29 @@ class StreamlitNavigationTest(unittest.TestCase):
             self.assertIn("group", context)
             self.assertIn("description", context)
             self.assertTrue(len(context["group"]) > 0)
+
+    def test_map_first_views_do_not_render_metric_previews_above_maps(self):
+        for fn in [
+            streamlit_app.render_trajectory_view,
+            streamlit_app.render_animation_view,
+            streamlit_app.render_minute_view,
+            streamlit_app.render_od_view,
+        ]:
+            source = inspect.getsource(fn)
+            self.assertNotIn("st.metric", source, fn.__name__)
+            self.assertNotIn("render_vehicle_status_panel", source, fn.__name__)
+
+    def test_validate_payload_limits_animation_speed_to_one_to_five(self):
+        payload = {
+            "trajectory_vehicle_ids": ["22225"],
+            "start_time": datetime(2023, 10, 12, 8, 0),
+            "end_time": datetime(2023, 10, 12, 9, 0),
+            "time_scale": 10.0,
+        }
+
+        errors = streamlit_app.validate_payload(payload)
+
+        self.assertIn("动画倍速必须在 1-5 倍之间。", errors)
 
 
 if __name__ == "__main__":

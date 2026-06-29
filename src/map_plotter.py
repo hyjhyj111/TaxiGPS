@@ -91,6 +91,8 @@ CONFIG = {
     "ANIMATION_GAP_THRESHOLD_S": 1800,
     "ANIMATION_SPEED_CAP_KMH": 120,
     "ANIMATION_DRIFT_CAP_KM": 8.0,
+    "ANIMATION_LOW_SPEED_DISPLAY_THRESHOLD_KMH": 5.0,
+    "ANIMATION_MIN_DRIVING_DISPLAY_SPEED_KMH": 15.0,
 }
 
 
@@ -1130,7 +1132,7 @@ def _road_network_cache_token(network_meta=None):
     network_meta = network_meta or {}
     path = network_meta.get("path") or "missing-road-network"
     version = _file_version_key(path) if path and os.path.exists(path) else "missing"
-    payload = f"road-corrected-v3-edge-geometry|{path}|{version}|{CONFIG['MAX_ROAD_CORRECTION_CACHE_POINTS']}"
+    payload = f"road-corrected-v5-edge-geometry-time-speed|{path}|{version}|{CONFIG['MAX_ROAD_CORRECTION_CACHE_POINTS']}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -1240,6 +1242,54 @@ def _corrected_rows_to_points(rows):
             continue
         points.append(point)
     return points
+
+
+def _distance_ratios_for_points(points):
+    if not points:
+        return []
+    if len(points) == 1:
+        return [0.0]
+
+    cumulative = [0.0]
+    total_distance = 0.0
+    for idx in range(1, len(points)):
+        prev = points[idx - 1]
+        current = points[idx]
+        distance = haversine_distance(prev[0], prev[1], current[0], current[1])
+        if pd.isna(distance):
+            distance = 0.0
+        total_distance += float(distance)
+        cumulative.append(total_distance)
+
+    if total_distance <= 0:
+        return [idx / max(1, len(points) - 1) for idx in range(len(points))]
+    return [distance / total_distance for distance in cumulative]
+
+
+def _interpolate_times_for_points(points, start_time, end_time):
+    if not points:
+        return []
+    start_ts = pd.Timestamp(start_time)
+    end_ts = pd.Timestamp(end_time)
+    if len(points) == 1 or end_ts <= start_ts:
+        return [start_ts for _ in points]
+
+    duration_ns = end_ts.value - start_ts.value
+    return [pd.Timestamp(start_ts.value + int(round(duration_ns * ratio))) for ratio in _distance_ratios_for_points(points)]
+
+
+def _interpolate_values_for_points(points, start_value, end_value):
+    if not points:
+        return []
+    try:
+        start_number = float(start_value)
+    except (TypeError, ValueError):
+        start_number = 0.0
+    try:
+        end_number = float(end_value)
+    except (TypeError, ValueError):
+        end_number = start_number
+    return [start_number + (end_number - start_number) * ratio for ratio in _distance_ratios_for_points(points)]
 
 
 def _edge_geometry_points(graph, source, target, weight="length"):
@@ -1892,6 +1942,7 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None, max_
         target = matched_nodes[idx]
         if source is None or target is None:
             continue
+        prev_row = sample_df.iloc[idx - 1]
         row = sample_df.iloc[idx]
         if undirected_graph is None and source != target and hasattr(graph, "is_directed") and graph.is_directed():
             try:
@@ -1930,32 +1981,62 @@ def correct_trajectory_with_road_network(df, graph=None, network_meta=None, max_
                 edge_key = 0 if edge_key is None else edge_key
                 edge_items.append((edge_source, edge_target, edge_key, edge_target, _edge_geometry_points(graph, edge_source, edge_target, weight="length")))
 
+        segment_items = []
         for edge_source, edge_target, edge_key, edge_node, edge_points in edge_items:
-            for point in edge_points:
+            for point in edge_points or []:
                 if not point:
                     continue
-                if corrected_points and corrected_points[-1] == point:
+                if segment_items and segment_items[-1]["point"] == point:
                     continue
-                corrected_points.append(point)
-                path_rows.append(
+                segment_items.append(
                     {
-                        "vehicle_id": str(row.get("vehicle_id", row.get("id", ""))),
-                        "time": row["time"],
-                        "status": int(row.get("status", 0) or 0),
-                        "speed": float(row.get("speed", 0.0) or 0.0),
-                        "raw_lon": float(row.get("long", np.nan)),
-                        "raw_lat": float(row.get("lati", np.nan)),
-                        "matched_lon": point[1],
-                        "matched_lat": point[0],
-                        "matched_node": edge_node,
-                        "edge_u": edge_source,
-                        "edge_v": edge_target,
+                        "point": point,
+                        "edge_source": edge_source,
+                        "edge_target": edge_target,
                         "edge_key": edge_key,
-                        "path_mode": mode,
-                        "sequence": sequence,
+                        "edge_node": edge_node,
                     }
                 )
-                sequence += 1
+
+        segment_times = _interpolate_times_for_points(
+            [item["point"] for item in segment_items],
+            prev_row["time"],
+            row["time"],
+        )
+        segment_speeds = _interpolate_values_for_points(
+            [item["point"] for item in segment_items],
+            prev_row.get("speed", 0.0),
+            row.get("speed", prev_row.get("speed", 0.0)),
+        )
+
+        for item, point_time, point_speed in zip(segment_items, segment_times, segment_speeds):
+            point = item["point"]
+            if corrected_points and corrected_points[-1] == point:
+                if path_rows:
+                    path_rows[-1]["time"] = min(pd.Timestamp(path_rows[-1]["time"]), pd.Timestamp(point_time))
+                    path_rows[-1]["speed"] = float(point_speed)
+                continue
+            vehicle_value = row.get("vehicle_id", row.get("id", prev_row.get("vehicle_id", prev_row.get("id", ""))))
+            corrected_points.append(point)
+            path_rows.append(
+                {
+                    "vehicle_id": str(vehicle_value),
+                    "time": point_time,
+                    "status": int(row.get("status", prev_row.get("status", 0)) or 0),
+                    "speed": float(point_speed),
+                    "raw_lon": float(row.get("long", np.nan)),
+                    "raw_lat": float(row.get("lati", np.nan)),
+                    "matched_lon": point[1],
+                    "matched_lat": point[0],
+                    "matched_node": item["edge_node"],
+                    "edge_u": item["edge_source"],
+                    "edge_v": item["edge_target"],
+                    "edge_key": item["edge_key"],
+                    "path_mode": mode,
+                    "sequence": sequence,
+                }
+            )
+            sequence += 1
 
     if len(corrected_points) > CONFIG["MAX_CORRECTED_PATH_POINTS"]:
         idx = np.linspace(0, len(corrected_points) - 1, num=CONFIG["MAX_CORRECTED_PATH_POINTS"], dtype=int)
@@ -2461,10 +2542,33 @@ def _trajectory_summary_stats(df):
     }
 
 
+def _clamp_animation_time_scale(time_scale):
+    try:
+        value = float(time_scale)
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(1.0, min(5.0, value))
+
+
+def _animation_display_speed(row):
+    observed_speed = float(row["speed"]) if "speed" in row and pd.notna(row["speed"]) else 0.0
+    geometry_speed = float(row.get("speed_kmh", 0.0)) if pd.notna(row.get("speed_kmh", 0.0)) else 0.0
+    distance_km = float(row.get("distance_km", 0.0)) if pd.notna(row.get("distance_km", 0.0)) else 0.0
+    low_threshold = float(CONFIG["ANIMATION_LOW_SPEED_DISPLAY_THRESHOLD_KMH"])
+    min_driving_speed = float(CONFIG["ANIMATION_MIN_DRIVING_DISPLAY_SPEED_KMH"])
+    cap = float(CONFIG["ANIMATION_SPEED_CAP_KMH"])
+
+    is_moving = geometry_speed >= low_threshold or distance_km >= 0.005
+    if is_moving and 0 <= observed_speed < low_threshold:
+        reference_speed = geometry_speed if geometry_speed > 0 else min_driving_speed
+        return min(cap, max(min_driving_speed, reference_speed))
+    return min(cap, max(0.0, observed_speed))
+
+
 def _vehicle_animation_features(df):
     features = []
     for idx, row in df.iterrows():
-        speed_value = float(row["speed_kmh"]) if "speed_kmh" in row and pd.notna(row["speed_kmh"]) else float(row.get("speed", 0.0))
+        speed_value = _animation_display_speed(row)
         time_ms = int(pd.Timestamp(row["time"]).timestamp() * 1000)
         features.append(
             {
@@ -2478,6 +2582,73 @@ def _vehicle_animation_features(df):
             }
         )
     return features
+
+
+def _corrected_rows_to_animation_df(rows, fallback_start_time=None, fallback_end_time=None):
+    rows = _normalize_corrected_cache_rows(rows)
+    if len(rows) < 2 or not {"matched_lat", "matched_lon", "time"}.issubset(rows.columns):
+        return pd.DataFrame()
+    df = rows.dropna(subset=["matched_lat", "matched_lon", "time"]).copy()
+    if len(df) < 2:
+        return pd.DataFrame()
+    df["lati"] = df["matched_lat"].astype(float)
+    df["long"] = df["matched_lon"].astype(float)
+    df["time"] = pd.to_datetime(df["time"])
+    df["status"] = pd.to_numeric(df.get("status", 0), errors="coerce").fillna(0).astype(int)
+    df["speed"] = pd.to_numeric(df.get("speed", 0.0), errors="coerce").fillna(0.0)
+    df = df.sort_values(["time", "sequence"]).drop_duplicates(subset=["time", "lati", "long", "status"]).reset_index(drop=True)
+    if df["time"].nunique() < len(df):
+        start_ts = safe_datetime(fallback_start_time) or df["time"].min()
+        end_ts = safe_datetime(fallback_end_time) or df["time"].max()
+        if pd.Timestamp(end_ts) > pd.Timestamp(start_ts):
+            df["time"] = _interpolate_times_for_points(df[["lati", "long"]].values.tolist(), start_ts, end_ts)
+    return df[["time", "long", "lati", "status", "speed"]]
+
+
+def _prepare_animation_dataframe(df):
+    if df is None or len(df) < 2:
+        return pd.DataFrame()
+    df = resample_trajectory(df, CONFIG["MAX_TRAJECTORY_POINTS"])
+    df = df.copy()
+    df["prev_time"] = df["time"].shift(1)
+    df["time_diff"] = (df["time"] - df["prev_time"]).dt.total_seconds().fillna(0)
+    df["prev_lat"] = df["lati"].shift(1)
+    df["prev_lng"] = df["long"].shift(1)
+    df["distance_km"] = df.apply(
+        lambda row: haversine_distance(row["prev_lat"], row["prev_lng"], row["lati"], row["long"]) if pd.notna(row["prev_time"]) else 0,
+        axis=1,
+    ).fillna(0.0)
+    df["speed_kmh"] = df.apply(
+        lambda row: (row["distance_km"] / (row["time_diff"] / 3600.0)) if row["time_diff"] and row["time_diff"] > 0 else 0.0,
+        axis=1,
+    ).replace([np.inf, -np.inf], 0.0)
+    df.loc[df["speed_kmh"] > CONFIG["ANIMATION_SPEED_CAP_KMH"], "speed_kmh"] = CONFIG["ANIMATION_SPEED_CAP_KMH"]
+    return df
+
+
+def _load_animation_trajectory(vehicle_id, start_time=None, end_time=None, graph=None, network_meta=None):
+    if graph is None:
+        graph, network_meta = load_road_network()
+    if graph is not None:
+        corrected = load_road_corrected_vehicle_slice(
+            vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
+            graph=graph,
+            network_meta=network_meta,
+        )
+        corrected_df = _corrected_rows_to_animation_df(corrected.get("rows"), fallback_start_time=start_time, fallback_end_time=end_time)
+        if len(corrected_df) >= 2:
+            log.info("动画轨迹使用路网校正缓存: vehicle_id=%s, points=%s", vehicle_id, len(corrected_df))
+            return _prepare_animation_dataframe(corrected_df)
+        log.warning(
+            "车辆 %s 路网校正动画点不足，回退原始轨迹: %s",
+            vehicle_id,
+            corrected.get("meta", {}).get("error", "校正结果不可用"),
+        )
+
+    raw_df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+    return _prepare_animation_dataframe(raw_df)
 
 
 def _lighten_hex_color(color):
@@ -2497,6 +2668,7 @@ def _lighten_hex_color(color):
 
 
 def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_start_ms, global_end_ms):
+    playback_scale = _clamp_animation_time_scale(time_scale)
     payload = json.dumps(
         {
             "vehicles": [
@@ -2663,8 +2835,8 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
         </div>
         <div class="row">
             <span class="label">速度缩放</span>
-            <input type="range" id="speedSlider" min="0.5" max="5" step="0.1" value="{time_scale}" onchange="updateSpeed()">
-            <span class="value" id="speedValue">{time_scale}x</span>
+            <input type="range" id="speedSlider" min="1" max="5" step="0.5" value="{playback_scale:.1f}" onchange="updateSpeed()">
+            <span class="value" id="speedValue">{playback_scale:.1f}x</span>
         </div>
     </div>
     <div id="map"></div>
@@ -2679,8 +2851,12 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
 
     <script>
         var fleetData = {payload}.vehicles;
-        var speedBaseMultiplier = 3.0;
-        var speedMultiplier = {float(time_scale)} * speedBaseMultiplier;
+        var speedBaseMultiplier = 1.0;
+        var speedMultiplier = {playback_scale:.1f} * speedBaseMultiplier;
+        var maxPlaybackSpeedKmh = 60.0;
+        var minMovementSpeedKmh = 1.0;
+        var targetFrameRate = 60;
+        var statusUpdateIntervalMs = 100;
         var minDelay = {CONFIG["ANIMATION_MIN_DELAY_MS"]};
         var animationFrameId = null;
         var isPlaying = false;
@@ -2690,6 +2866,15 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
         var globalStartMs = {int(global_start_ms)};
         var globalEndMs = {int(global_end_ms)};
         var lastFrameTimestamp = 0;
+        var lastFleetStatusUpdateAt = 0;
+        var frameStats = {{
+            targetFps: targetFrameRate,
+            fps: 0,
+            belowTarget: false,
+            sampleStart: 0,
+            sampleFrames: 0
+        }};
+        window.__taxigpsAnimationStats = frameStats;
 
         var map = L.map('map', {{
             preferCanvas: true,
@@ -2716,6 +2901,46 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
 
         function lerp(a, b, t) {{
             return a + (b - a) * t;
+        }}
+
+        function recordFrameSample(frameTimestamp) {{
+            if (!isFinite(frameTimestamp) || frameTimestamp <= 0) return;
+            if (!frameStats.sampleStart) {{
+                frameStats.sampleStart = frameTimestamp;
+                frameStats.sampleFrames = 0;
+            }}
+            frameStats.sampleFrames += 1;
+            var elapsed = frameTimestamp - frameStats.sampleStart;
+            if (elapsed >= 1000) {{
+                frameStats.fps = frameStats.sampleFrames * 1000 / elapsed;
+                frameStats.belowTarget = frameStats.fps < targetFrameRate;
+                frameStats.sampleStart = frameTimestamp;
+                frameStats.sampleFrames = 0;
+            }}
+        }}
+
+        function segmentDurationMs(rawDuration, segmentDistance, startSpeed, endSpeed) {{
+            if (segmentDistance <= 0) {{
+                return rawDuration;
+            }}
+            var startObservedSpeed = Math.max(0, Number(startSpeed || 0));
+            var endObservedSpeed = Math.max(0, Number(endSpeed || 0));
+            var averageObservedSpeed = Math.max(minMovementSpeedKmh, (startObservedSpeed + endObservedSpeed) / 2);
+            var observedDuration = (segmentDistance / averageObservedSpeed) * 3600000;
+            var minimumDuration = (segmentDistance / maxPlaybackSpeedKmh) * 3600000;
+            return Math.max(rawDuration, observedDuration, minimumDuration);
+        }}
+
+        function speedAwareProgress(t, startSpeed, endSpeed) {{
+            var x = clamp(t, 0, 1);
+            var startObservedSpeed = Math.max(0, Number(startSpeed || 0));
+            var endObservedSpeed = Math.max(0, Number(endSpeed || 0));
+            var averageObservedSpeed = (startObservedSpeed + endObservedSpeed) / 2;
+            if (averageObservedSpeed <= 0.01) {{
+                return x;
+            }}
+            var distanceRatio = (startObservedSpeed * x + 0.5 * (endObservedSpeed - startObservedSpeed) * x * x) / averageObservedSpeed;
+            return clamp(distanceRatio, 0, 1);
         }}
 
         function easeInOutCubic(t) {{
@@ -2762,13 +2987,19 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             vehicle.segments = [];
             vehicle.previewLine = null;
             vehicle.travelLine = null;
+            vehicle.travelLineState = {{fixedIndex: 0, hasMovingPoint: false}};
             vehicle.marker = null;
             vehicle.currentSegmentIndex = 0;
             vehicle.currentTimeMs = vehicle.features.length > 0 ? vehicle.features[0].timeMs : 0;
+            vehicle.lastStatusUpdateAt = 0;
 
             if (vehicle.features.length === 0) {{
                 return;
             }}
+
+            var timelineCursor = Math.max(0, Number(vehicle.features[0].timeMs || globalStartMs) - globalStartMs);
+            vehicle.timelineStartMs = timelineCursor;
+            vehicle.timelineEndMs = timelineCursor;
 
             for (var i = 0; i < vehicle.features.length; i++) {{
                 var feature = vehicle.features[i];
@@ -2777,8 +3008,11 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
                 var prev = vehicle.features[i - 1];
                 var rawDuration = Math.max(1, feature.timeMs - prev.timeMs);
                 var segmentDistance = haversine(prev.lat, prev.lng, feature.lat, feature.lng);
-                var segmentSpeed = rawDuration > 0 && segmentDistance > 0
-                    ? Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, segmentDistance / (rawDuration / 3600000))
+                var startDisplaySpeed = Number(prev.speed || 0);
+                var endDisplaySpeed = Number(feature.speed || 0);
+                var duration = segmentDurationMs(rawDuration, segmentDistance, startDisplaySpeed, endDisplaySpeed);
+                var segmentSpeed = duration > 0 && segmentDistance > 0
+                    ? Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, segmentDistance / (duration / 3600000))
                     : feature.speed;
                 vehicle.segments.push({{
                     startIndex: i - 1,
@@ -2787,13 +3021,18 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
                     startLng: prev.lng,
                     endLat: feature.lat,
                     endLng: feature.lng,
-                    startTimeMs: prev.timeMs,
-                    endTimeMs: feature.timeMs,
-                    durationMs: rawDuration,
+                    startTimeMs: timelineCursor,
+                    endTimeMs: timelineCursor + duration,
+                    durationMs: duration,
                     speedKmh: segmentSpeed,
+                    startDisplaySpeed: startDisplaySpeed,
+                    endDisplaySpeed: endDisplaySpeed,
                     status: prev.status
                 }});
+                timelineCursor += duration;
             }}
+            vehicle.timelineEndMs = Math.max(vehicle.timelineStartMs + 1, timelineCursor);
+            totalDurationMs = Math.max(totalDurationMs, vehicle.timelineEndMs);
 
             var first = vehicle.features[0];
             var markerIcon = L.divIcon({{
@@ -2816,6 +3055,40 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             vehicle.marker = L.marker(vehicle.pathLatLngs[0], {{icon: markerIcon}}).addTo(map);
             vehicle.marker.bindTooltip('车辆 ' + vehicle.vehicleId, {{sticky: true}});
             vehicle.marker.bindPopup('<b>车辆 ' + vehicle.vehicleId + '</b><br>开始时间: ' + first.time + '<br>状态: ' + (first.status === 1 ? '载客' : '空载'));
+        }}
+
+        function resetTravelLineState(line, state, firstLatLng) {{
+            state.fixedIndex = 0;
+            state.hasMovingPoint = false;
+            line.setLatLngs([firstLatLng]);
+        }}
+
+        function updateTravelLineEndpoint(line, pathLatLngs, targetIndex, currentLatLng, travelLineState) {{
+            if (!pathLatLngs || pathLatLngs.length === 0) return;
+            var latLngs = line.getLatLngs();
+            if (latLngs.length === 0) {{
+                line.addLatLng(pathLatLngs[0]);
+                latLngs = line.getLatLngs();
+            }}
+            while (travelLineState.fixedIndex < targetIndex && travelLineState.fixedIndex + 1 < pathLatLngs.length) {{
+                var nextFixed = pathLatLngs[travelLineState.fixedIndex + 1];
+                if (travelLineState.hasMovingPoint && latLngs.length > 0) {{
+                    latLngs[latLngs.length - 1] = L.latLng(nextFixed[0], nextFixed[1]);
+                    travelLineState.hasMovingPoint = false;
+                    line.redraw();
+                }} else {{
+                    line.addLatLng(nextFixed);
+                    latLngs = line.getLatLngs();
+                }}
+                travelLineState.fixedIndex += 1;
+            }}
+            if (travelLineState.hasMovingPoint && latLngs.length > 0) {{
+                latLngs[latLngs.length - 1] = L.latLng(currentLatLng[0], currentLatLng[1]);
+                line.redraw();
+            }} else {{
+                line.addLatLng(currentLatLng);
+                travelLineState.hasMovingPoint = true;
+            }}
         }}
 
         function buildStatusGrid() {{
@@ -2844,59 +3117,77 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             if (progressNode) progressNode.textContent = Math.round(progress * 100) + '%';
         }}
 
-        function renderVehicle(vehicle, currentTimeMs) {{
+        function maybeUpdateVehicleCard(vehicle, currentTimeMs, currentSpeed, currentStatus, progress, frameTimestamp, forceUpdate) {{
+            var now = frameTimestamp || performance.now();
+            if (!forceUpdate && now - vehicle.lastStatusUpdateAt < statusUpdateIntervalMs) {{
+                return;
+            }}
+            vehicle.lastStatusUpdateAt = now;
+            updateVehicleCard(vehicle, currentTimeMs, currentSpeed, currentStatus, progress);
+        }}
+
+        function renderVehicle(vehicle, currentElapsed, frameTimestamp, forceStatusUpdate) {{
             if (!vehicle.features || vehicle.features.length === 0) return;
 
             var first = vehicle.features[0];
             var last = vehicle.features[vehicle.features.length - 1];
             var renderLat = first.lat;
             var renderLng = first.lng;
-            var traveledLatLngs = [vehicle.pathLatLngs[0]];
+            var travelTargetIndex = 0;
             var currentSpeed = first.speed || 0;
             var currentStatus = first.status === 1 ? '载客' : '空载';
             var progress = 0;
 
-            if (currentTimeMs <= first.timeMs) {{
+            if (currentElapsed <= vehicle.timelineStartMs) {{
                 vehicle.currentSegmentIndex = 0;
-            }} else if (currentTimeMs >= last.timeMs) {{
+            }} else if (currentElapsed >= vehicle.timelineEndMs) {{
                 renderLat = last.lat;
                 renderLng = last.lng;
-                traveledLatLngs = vehicle.pathLatLngs.slice();
+                travelTargetIndex = vehicle.pathLatLngs.length - 1;
                 currentSpeed = last.speed || 0;
                 currentStatus = last.status === 1 ? '载客' : '空载';
                 progress = 1;
                 vehicle.currentSegmentIndex = vehicle.segments.length - 1;
             }} else {{
-                while (vehicle.currentSegmentIndex < vehicle.segments.length - 1 && currentTimeMs > vehicle.segments[vehicle.currentSegmentIndex].endTimeMs) {{
+                while (vehicle.currentSegmentIndex < vehicle.segments.length - 1 && currentElapsed > vehicle.segments[vehicle.currentSegmentIndex].endTimeMs) {{
                     vehicle.currentSegmentIndex += 1;
                 }}
-                while (vehicle.currentSegmentIndex > 0 && currentTimeMs < vehicle.segments[vehicle.currentSegmentIndex].startTimeMs) {{
+                while (vehicle.currentSegmentIndex > 0 && currentElapsed < vehicle.segments[vehicle.currentSegmentIndex].startTimeMs) {{
                     vehicle.currentSegmentIndex -= 1;
                 }}
 
                 var segment = vehicle.segments[vehicle.currentSegmentIndex];
-                var localElapsed = currentTimeMs - segment.startTimeMs;
+                var localElapsed = currentElapsed - segment.startTimeMs;
                 var rawT = segment.durationMs > 0 ? clamp(localElapsed / segment.durationMs, 0, 1) : 1;
-                var easedT = rawT;
+                var easedT = speedAwareProgress(rawT, segment.startDisplaySpeed, segment.endDisplaySpeed);
                 renderLat = lerp(segment.startLat, segment.endLat, easedT);
                 renderLng = lerp(segment.startLng, segment.endLng, easedT);
-                currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh));
+                currentSpeed = Math.max(0, lerp(segment.startDisplaySpeed, segment.endDisplaySpeed, rawT));
                 currentStatus = segment.status === 1 ? '载客' : '空载';
-                progress = clamp((currentTimeMs - first.timeMs) / Math.max(1, last.timeMs - first.timeMs), 0, 1);
-                traveledLatLngs = vehicle.pathLatLngs.slice(0, segment.startIndex + 1).concat([[renderLat, renderLng]]);
+                progress = clamp((currentElapsed - vehicle.timelineStartMs) / Math.max(1, vehicle.timelineEndMs - vehicle.timelineStartMs), 0, 1);
+                travelTargetIndex = segment.startIndex;
             }}
 
-            vehicle.travelLine.setLatLngs(traveledLatLngs);
+            updateTravelLineEndpoint(vehicle.travelLine, vehicle.pathLatLngs, travelTargetIndex, [renderLat, renderLng], vehicle.travelLineState);
             vehicle.marker.setLatLng([renderLat, renderLng]);
-            updateVehicleCard(vehicle, currentTimeMs, currentSpeed, currentStatus, progress);
+            maybeUpdateVehicleCard(vehicle, currentElapsed, currentSpeed, currentStatus, progress, frameTimestamp, forceStatusUpdate);
         }}
 
-        function renderFleet(currentElapsed) {{
+        function maybeUpdateFleetStatus(currentElapsed, frameTimestamp, forceStatusUpdate) {{
+            var now = frameTimestamp || performance.now();
+            if (!forceStatusUpdate && now - lastFleetStatusUpdateAt < statusUpdateIntervalMs) {{
+                return;
+            }}
+            lastFleetStatusUpdateAt = now;
             var currentTimeMs = globalStartMs + clamp(currentElapsed, 0, totalDurationMs);
             document.getElementById('currentTime').textContent = formatTimeFromMs(currentTimeMs);
             document.getElementById('globalProgress').textContent = Math.round(clamp(currentElapsed / totalDurationMs, 0, 1) * 100) + '%';
+        }}
+
+        function renderFleet(currentElapsed, frameTimestamp, forceStatusUpdate) {{
+            maybeUpdateFleetStatus(currentElapsed, frameTimestamp, forceStatusUpdate);
             for (var i = 0; i < fleetData.length; i++) {{
-                renderVehicle(fleetData[i], currentTimeMs);
+                renderVehicle(fleetData[i], currentElapsed, frameTimestamp, forceStatusUpdate);
             }}
         }}
 
@@ -2916,7 +3207,8 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             }}
             if (virtualElapsed >= totalDurationMs) {{
                 pausedVirtualElapsed = totalDurationMs;
-                renderFleet(totalDurationMs);
+                recordFrameSample(currentTime);
+                renderFleet(totalDurationMs, currentTime, true);
                 isPlaying = false;
                 if (animationFrameId) {{
                     cancelAnimationFrame(animationFrameId);
@@ -2925,7 +3217,8 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
                 return;
             }}
             pausedVirtualElapsed = virtualElapsed;
-            renderFleet(virtualElapsed);
+            recordFrameSample(currentTime);
+            renderFleet(virtualElapsed, currentTime, false);
             animationFrameId = requestAnimationFrame(tick);
         }}
 
@@ -2953,7 +3246,16 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             pausedVirtualElapsed = 0;
             lastFrameTimestamp = 0;
             playStartedAt = 0;
-            renderFleet(0);
+            for (var i = 0; i < fleetData.length; i++) {{
+                var vehicle = fleetData[i];
+                if (vehicle.pathLatLngs && vehicle.pathLatLngs.length > 0) {{
+                    resetTravelLineState(vehicle.travelLine, vehicle.travelLineState, vehicle.pathLatLngs[0]);
+                    vehicle.currentSegmentIndex = 0;
+                    vehicle.lastStatusUpdateAt = 0;
+                }}
+            }}
+            lastFleetStatusUpdateAt = 0;
+            renderFleet(0, performance.now(), true);
         }}
 
         function updateSpeed() {{
@@ -2969,7 +3271,7 @@ def _build_multi_animation_html(vehicle_entries, time_scale, bounds, global_star
             }}
             document.getElementById('speedValue').textContent = selectedSpeed.toFixed(1) + 'x';
             if (!isPlaying) {{
-                renderFleet(pausedVirtualElapsed);
+                renderFleet(pausedVirtualElapsed, performance.now(), true);
             }}
         }}
 
@@ -4007,9 +4309,10 @@ def plot_od_points(start_time, end_time, vehicle_id=None, vehicle_ids=None, save
 
 
 def _build_animation_html(vehicle_id, df, time_scale):
+    playback_scale = _clamp_animation_time_scale(time_scale)
     features = []
     for idx, row in df.iterrows():
-        speed_value = float(row["speed_kmh"]) if "speed_kmh" in row and pd.notna(row["speed_kmh"]) else float(row.get("speed", 0.0))
+        speed_value = _animation_display_speed(row)
         time_ms = int(pd.Timestamp(row["time"]).timestamp() * 1000)
         features.append(
             {
@@ -4128,8 +4431,8 @@ def _build_animation_html(vehicle_id, df, time_scale):
         </div>
         <div>
             <span class="label">速度缩放</span>
-            <input type="range" id="speedSlider" min="0.5" max="5" step="0.1" value="{time_scale}" onchange="updateSpeed()">
-            <span class="value" id="speedValue">{time_scale}x</span>
+            <input type="range" id="speedSlider" min="1" max="5" step="0.5" value="{playback_scale:.1f}" onchange="updateSpeed()">
+            <span class="value" id="speedValue">{playback_scale:.1f}x</span>
         </div>
     </div>
     <div id="map"></div>
@@ -4142,8 +4445,12 @@ def _build_animation_html(vehicle_id, df, time_scale):
 
     <script>
         var trajectoryData = {payload};
-        var speedBaseMultiplier = 3.0;
-        var speedMultiplier = {float(time_scale)} * speedBaseMultiplier;
+        var speedBaseMultiplier = 1.0;
+        var speedMultiplier = {playback_scale:.1f} * speedBaseMultiplier;
+        var maxPlaybackSpeedKmh = 60.0;
+        var minMovementSpeedKmh = 1.0;
+        var targetFrameRate = 60;
+        var statusUpdateIntervalMs = 100;
         var minDelay = {CONFIG["ANIMATION_MIN_DELAY_MS"]};
         var animationFrameId = null;
         var isPlaying = false;
@@ -4154,7 +4461,17 @@ def _build_animation_html(vehicle_id, df, time_scale):
         var segments = [];
         var pathLatLngs = [];
         var basePath = [];
+        var travelLineState = {{fixedIndex: 0, hasMovingPoint: false}};
         var lastFrameTimestamp = 0;
+        var lastStatusUpdateAt = 0;
+        var frameStats = {{
+            targetFps: targetFrameRate,
+            fps: 0,
+            belowTarget: false,
+            sampleStart: 0,
+            sampleFrames: 0
+        }};
+        window.__taxigpsAnimationStats = frameStats;
 
         var map = L.map('map', {{
             preferCanvas: true,
@@ -4192,6 +4509,46 @@ def _build_animation_html(vehicle_id, df, time_scale):
 
         function lerp(a, b, t) {{
             return a + (b - a) * t;
+        }}
+
+        function recordFrameSample(frameTimestamp) {{
+            if (!isFinite(frameTimestamp) || frameTimestamp <= 0) return;
+            if (!frameStats.sampleStart) {{
+                frameStats.sampleStart = frameTimestamp;
+                frameStats.sampleFrames = 0;
+            }}
+            frameStats.sampleFrames += 1;
+            var elapsed = frameTimestamp - frameStats.sampleStart;
+            if (elapsed >= 1000) {{
+                frameStats.fps = frameStats.sampleFrames * 1000 / elapsed;
+                frameStats.belowTarget = frameStats.fps < targetFrameRate;
+                frameStats.sampleStart = frameTimestamp;
+                frameStats.sampleFrames = 0;
+            }}
+        }}
+
+        function segmentDurationMs(rawDuration, segmentDistance, startSpeed, endSpeed) {{
+            if (segmentDistance <= 0) {{
+                return rawDuration;
+            }}
+            var startObservedSpeed = Math.max(0, Number(startSpeed || 0));
+            var endObservedSpeed = Math.max(0, Number(endSpeed || 0));
+            var averageObservedSpeed = Math.max(minMovementSpeedKmh, (startObservedSpeed + endObservedSpeed) / 2);
+            var observedDuration = (segmentDistance / averageObservedSpeed) * 3600000;
+            var minimumDuration = (segmentDistance / maxPlaybackSpeedKmh) * 3600000;
+            return Math.max(rawDuration, observedDuration, minimumDuration);
+        }}
+
+        function speedAwareProgress(t, startSpeed, endSpeed) {{
+            var x = clamp(t, 0, 1);
+            var startObservedSpeed = Math.max(0, Number(startSpeed || 0));
+            var endObservedSpeed = Math.max(0, Number(endSpeed || 0));
+            var averageObservedSpeed = (startObservedSpeed + endObservedSpeed) / 2;
+            if (averageObservedSpeed <= 0.01) {{
+                return x;
+            }}
+            var distanceRatio = (startObservedSpeed * x + 0.5 * (endObservedSpeed - startObservedSpeed) * x * x) / averageObservedSpeed;
+            return clamp(distanceRatio, 0, 1);
         }}
 
         function easeLinear(t) {{
@@ -4242,7 +4599,9 @@ def _build_animation_html(vehicle_id, df, time_scale):
                 var prevTimeMs = Number(prev.properties.timeMs || 0);
                 var rawDuration = Math.max(1, timeMs - prevTimeMs);
                 var segmentDistance = haversine(prevLat, prevLng, lat, lng);
-                var duration = rawDuration;
+                var startDisplaySpeed = Number(prev.properties.speed || 0);
+                var endDisplaySpeed = speed;
+                var duration = segmentDurationMs(rawDuration, segmentDistance, startDisplaySpeed, endDisplaySpeed);
                 var segmentSpeed = 0;
                 if (duration > 0) {{
                     segmentSpeed = segmentDistance > 0 ? Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, segmentDistance / (duration / 3600000)) : speed;
@@ -4254,17 +4613,53 @@ def _build_animation_html(vehicle_id, df, time_scale):
                     startLng: prevLng,
                     endLat: lat,
                     endLng: lng,
-                    startSpeed: Number(prev.properties.speed || 0),
-                    endSpeed: speed,
+                    startSpeed: startDisplaySpeed,
+                    endSpeed: endDisplaySpeed,
                     durationMs: duration,
                     startTimeMs: totalDurationMs,
                     endTimeMs: totalDurationMs + duration,
                     speedKmh: segmentSpeed,
+                    startDisplaySpeed: startDisplaySpeed,
+                    endDisplaySpeed: endDisplaySpeed,
                 }});
                 totalDurationMs += duration;
             }}
             previewLine.setLatLngs(pathLatLngs);
             basePath = pathLatLngs.slice(0, 1);
+        }}
+
+        function resetTravelLineState(firstLatLng) {{
+            travelLineState.fixedIndex = 0;
+            travelLineState.hasMovingPoint = false;
+            traveledLine.setLatLngs([firstLatLng]);
+        }}
+
+        function updateTravelLineEndpoint(targetIndex, currentLatLng) {{
+            if (pathLatLngs.length === 0) return;
+            var latLngs = traveledLine.getLatLngs();
+            if (latLngs.length === 0) {{
+                traveledLine.addLatLng(pathLatLngs[0]);
+                latLngs = traveledLine.getLatLngs();
+            }}
+            while (travelLineState.fixedIndex < targetIndex && travelLineState.fixedIndex + 1 < pathLatLngs.length) {{
+                var nextFixed = pathLatLngs[travelLineState.fixedIndex + 1];
+                if (travelLineState.hasMovingPoint && latLngs.length > 0) {{
+                    latLngs[latLngs.length - 1] = L.latLng(nextFixed[0], nextFixed[1]);
+                    travelLineState.hasMovingPoint = false;
+                    traveledLine.redraw();
+                }} else {{
+                    traveledLine.addLatLng(nextFixed);
+                    latLngs = traveledLine.getLatLngs();
+                }}
+                travelLineState.fixedIndex += 1;
+            }}
+            if (travelLineState.hasMovingPoint && latLngs.length > 0) {{
+                latLngs[latLngs.length - 1] = L.latLng(currentLatLng[0], currentLatLng[1]);
+                traveledLine.redraw();
+            }} else {{
+                traveledLine.addLatLng(currentLatLng);
+                travelLineState.hasMovingPoint = true;
+            }}
         }}
 
         function haversine(lat1, lng1, lat2, lng2) {{
@@ -4307,7 +4702,16 @@ def _build_animation_html(vehicle_id, df, time_scale):
             updatePlaybackInfo(currentElapsed, currentSpeed);
         }}
 
-        function renderFrame(currentElapsed) {{
+        function maybeUpdateInfoByPosition(lat, lng, currentElapsed, currentSpeed, status, frameTimestamp, forceUpdate) {{
+            var now = frameTimestamp || performance.now();
+            if (!forceUpdate && now - lastStatusUpdateAt < statusUpdateIntervalMs) {{
+                return;
+            }}
+            lastStatusUpdateAt = now;
+            updateInfoByPosition(lat, lng, currentElapsed, currentSpeed, status);
+        }}
+
+        function renderFrame(currentElapsed, frameTimestamp, forceStatusUpdate) {{
             if (segments.length === 0) return;
             var total = totalDurationMs;
             var elapsed = clamp(currentElapsed, 0, total);
@@ -4322,15 +4726,15 @@ def _build_animation_html(vehicle_id, df, time_scale):
             var segment = segments[segmentIndex];
             var localElapsed = elapsed - segment.startTimeMs;
             var rawT = segment.durationMs > 0 ? clamp(localElapsed / segment.durationMs, 0, 1) : 1;
-            var easedT = rawT;
+            var easedT = speedAwareProgress(rawT, segment.startDisplaySpeed, segment.endDisplaySpeed);
             var lat = lerp(segment.startLat, segment.endLat, easedT);
             var lng = lerp(segment.startLng, segment.endLng, easedT);
-            var currentSpeed = Math.min({CONFIG["ANIMATION_SPEED_CAP_KMH"]}, Math.max(0, segment.speedKmh));
+            var currentSpeed = Math.max(0, lerp(segment.startDisplaySpeed, segment.endDisplaySpeed, rawT));
             var status = trajectoryData.features[segment.startIndex].properties.status;
 
-            traveledLine.setLatLngs(pathLatLngs.slice(0, segment.startIndex + 1).concat([[lat, lng]]));
+            updateTravelLineEndpoint(segment.startIndex, [lat, lng]);
             carMarker.setLatLng([lat, lng]);
-            updateInfoByPosition(lat, lng, elapsed, currentSpeed, status);
+            maybeUpdateInfoByPosition(lat, lng, elapsed, currentSpeed, status, frameTimestamp, forceStatusUpdate);
         }}
 
         function getVirtualElapsed(now) {{
@@ -4353,7 +4757,8 @@ def _build_animation_html(vehicle_id, df, time_scale):
 
             if (virtualElapsed >= totalDurationMs) {{
                 pausedVirtualElapsed = totalDurationMs;
-                renderFrame(totalDurationMs);
+                recordFrameSample(currentTime);
+                renderFrame(totalDurationMs, currentTime, true);
                 isPlaying = false;
                 if (animationFrameId) {{
                     cancelAnimationFrame(animationFrameId);
@@ -4363,7 +4768,8 @@ def _build_animation_html(vehicle_id, df, time_scale):
             }}
 
             pausedVirtualElapsed = virtualElapsed;
-            renderFrame(virtualElapsed);
+            recordFrameSample(currentTime);
+            renderFrame(virtualElapsed, currentTime, false);
             animationFrameId = requestAnimationFrame(tick);
         }}
 
@@ -4409,7 +4815,7 @@ def _build_animation_html(vehicle_id, df, time_scale):
                 var first = trajectoryData.features[0];
                 var firstLatLng = pathLatLngs[0];
                 carMarker.setLatLng(firstLatLng);
-                traveledLine.setLatLngs([firstLatLng]);
+                resetTravelLineState(firstLatLng);
                 updateInfoByPosition(firstLatLng[0], firstLatLng[1], 0, Number(first.properties.speed || 0), Number(first.properties.status || 0));
                 document.getElementById('progress').textContent = '0%';
             }}
@@ -4428,7 +4834,7 @@ def _build_animation_html(vehicle_id, df, time_scale):
             }}
             document.getElementById('speedValue').textContent = selectedSpeed.toFixed(1) + 'x';
             if (!isPlaying) {{
-                renderFrame(pausedVirtualElapsed);
+                renderFrame(pausedVirtualElapsed, performance.now(), true);
             }}
         }}
 
@@ -4444,26 +4850,10 @@ def _build_animation_html(vehicle_id, df, time_scale):
 def plot_animated_trajectory(vehicle_id, start_time=None, end_time=None, time_scale=1.0, save_path=None):
     log.info("生成动画轨迹: vehicle_id=%s, time_scale=%s", vehicle_id, time_scale)
 
-    df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+    df = _load_animation_trajectory(vehicle_id, start_time, end_time)
     if df is None or len(df) < 2:
         log.warning("轨迹数据不足，无法生成动画")
         return None
-
-    df = resample_trajectory(df, CONFIG["MAX_TRAJECTORY_POINTS"])
-    df = df.copy()
-    df["prev_time"] = df["time"].shift(1)
-    df["time_diff"] = (df["time"] - df["prev_time"]).dt.total_seconds().fillna(0)
-    df["prev_lat"] = df["lati"].shift(1)
-    df["prev_lng"] = df["long"].shift(1)
-    df["distance_km"] = df.apply(
-        lambda row: haversine_distance(row["prev_lat"], row["prev_lng"], row["lati"], row["long"]) if pd.notna(row["prev_time"]) else 0,
-        axis=1,
-    ).fillna(0.0)
-    df["speed_kmh"] = df.apply(
-        lambda row: (row["distance_km"] / (row["time_diff"] / 3600.0)) if row["time_diff"] and row["time_diff"] > 0 else 0.0,
-        axis=1,
-    ).replace([np.inf, -np.inf], 0.0)
-    df.loc[df["speed_kmh"] > CONFIG["ANIMATION_SPEED_CAP_KMH"], "speed_kmh"] = CONFIG["ANIMATION_SPEED_CAP_KMH"]
 
     m = build_map(df)
     add_map_layers(m)
@@ -4532,27 +4922,13 @@ def plot_multi_vehicle_animated_trajectory(vehicle_ids, start_time=None, end_tim
 
     loaded_entries = []
     loaded_frames = []
+    graph, network_meta = load_road_network()
     for index, vehicle_id in enumerate(cleaned_vehicle_ids):
-        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+        df = _load_animation_trajectory(vehicle_id, start_time, end_time, graph=graph, network_meta=network_meta)
         if df is None or len(df) < 2:
             log.warning("车辆 %s 轨迹点不足，跳过动画", vehicle_id)
             continue
 
-        df = resample_trajectory(df, CONFIG["MAX_TRAJECTORY_POINTS"])
-        df = df.copy()
-        df["prev_time"] = df["time"].shift(1)
-        df["time_diff"] = (df["time"] - df["prev_time"]).dt.total_seconds().fillna(0)
-        df["prev_lat"] = df["lati"].shift(1)
-        df["prev_lng"] = df["long"].shift(1)
-        df["distance_km"] = df.apply(
-            lambda row: haversine_distance(row["prev_lat"], row["prev_lng"], row["lati"], row["long"]) if pd.notna(row["prev_time"]) else 0,
-            axis=1,
-        ).fillna(0.0)
-        df["speed_kmh"] = df.apply(
-            lambda row: (row["distance_km"] / (row["time_diff"] / 3600.0)) if row["time_diff"] and row["time_diff"] > 0 else 0.0,
-            axis=1,
-        ).replace([np.inf, -np.inf], 0.0)
-        df.loc[df["speed_kmh"] > CONFIG["ANIMATION_SPEED_CAP_KMH"], "speed_kmh"] = CONFIG["ANIMATION_SPEED_CAP_KMH"]
         color = _trajectory_color(index)
         loaded_entries.append((vehicle_id, df, color))
         loaded_frames.append(df)

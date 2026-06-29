@@ -138,6 +138,74 @@ class RoadCorrectionCacheTest(unittest.TestCase):
 
         self.assertIn([22.02, 114.01], result["points"])
 
+    def test_road_correction_interpolates_times_across_edge_geometry(self):
+        import networkx as nx
+        from shapely.geometry import LineString
+
+        graph = nx.MultiDiGraph()
+        graph.graph["crs"] = "epsg:4326"
+        graph.add_node(1, x=114.000, y=22.000)
+        graph.add_node(2, x=114.020, y=22.000)
+        graph.add_edge(
+            1,
+            2,
+            key=0,
+            length=3000.0,
+            geometry=LineString([(114.000, 22.000), (114.010, 22.020), (114.020, 22.000)]),
+        )
+        df = pd.DataFrame(
+            {
+                "time": pd.to_datetime(["2023-10-12 12:00:00", "2023-10-12 12:05:00"]),
+                "long": [114.0001, 114.0199],
+                "lati": [22.0001, 22.0001],
+                "status": [0, 1],
+                "speed": [20.0, 20.0],
+                "vehicle_id": ["22223", "22223"],
+            }
+        )
+
+        result = map_plotter.correct_trajectory_with_road_network(df, graph=graph, network_meta={"path": "/tmp/road.pkl"})
+        rows = result["path_rows"]
+
+        self.assertEqual(rows.iloc[0]["time"], pd.Timestamp("2023-10-12 12:00:00"))
+        self.assertEqual(rows.iloc[-1]["time"], pd.Timestamp("2023-10-12 12:05:00"))
+        self.assertTrue(rows["time"].is_monotonic_increasing)
+        self.assertGreater(rows["time"].nunique(), 2)
+
+    def test_road_correction_interpolates_speed_across_edge_geometry(self):
+        import networkx as nx
+        from shapely.geometry import LineString
+
+        graph = nx.MultiDiGraph()
+        graph.graph["crs"] = "epsg:4326"
+        graph.add_node(1, x=114.000, y=22.000)
+        graph.add_node(2, x=114.020, y=22.000)
+        graph.add_edge(
+            1,
+            2,
+            key=0,
+            length=3000.0,
+            geometry=LineString([(114.000, 22.000), (114.010, 22.020), (114.020, 22.000)]),
+        )
+        df = pd.DataFrame(
+            {
+                "time": pd.to_datetime(["2023-10-12 12:00:00", "2023-10-12 12:05:00"]),
+                "long": [114.0001, 114.0199],
+                "lati": [22.0001, 22.0001],
+                "status": [0, 1],
+                "speed": [10.0, 30.0],
+                "vehicle_id": ["22223", "22223"],
+            }
+        )
+
+        result = map_plotter.correct_trajectory_with_road_network(df, graph=graph, network_meta={"path": "/tmp/road.pkl"})
+        speeds = result["path_rows"]["speed"].round(3).tolist()
+
+        self.assertEqual(speeds[0], 10.0)
+        self.assertEqual(speeds[-1], 30.0)
+        self.assertGreater(len(set(speeds)), 2)
+        self.assertTrue(result["path_rows"]["speed"].is_monotonic_increasing)
+
 
 if __name__ == "__main__":
     unittest.main()
