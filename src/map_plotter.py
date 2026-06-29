@@ -10,7 +10,7 @@ import sys
 from functools import lru_cache
 from datetime import datetime
 from math import atan2, cos, radians, sin, sqrt
-from time import perf_counter
+from time import perf_counter, mktime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -2565,11 +2565,18 @@ def _animation_display_speed(row):
     return min(cap, max(0.0, observed_speed))
 
 
+def _local_wall_time_ms(value):
+    dt = safe_datetime(value)
+    if dt is None:
+        return 0
+    return int(mktime(pd.Timestamp(dt).to_pydatetime().timetuple()) * 1000)
+
+
 def _vehicle_animation_features(df):
     features = []
     for idx, row in df.iterrows():
         speed_value = _animation_display_speed(row)
-        time_ms = int(pd.Timestamp(row["time"]).timestamp() * 1000)
+        time_ms = _local_wall_time_ms(row["time"])
         features.append(
             {
                 "lat": float(row["lati"]),
@@ -4313,7 +4320,7 @@ def _build_animation_html(vehicle_id, df, time_scale):
     features = []
     for idx, row in df.iterrows():
         speed_value = _animation_display_speed(row)
-        time_ms = int(pd.Timestamp(row["time"]).timestamp() * 1000)
+        time_ms = _local_wall_time_ms(row["time"])
         features.append(
             {
                 "type": "Feature",
@@ -4944,8 +4951,8 @@ def plot_multi_vehicle_animated_trajectory(vehicle_ids, start_time=None, end_tim
         "minLng": float(combined_df["long"].min()),
         "maxLng": float(combined_df["long"].max()),
     }
-    global_start_ms = int(combined_df["time"].min().timestamp() * 1000)
-    global_end_ms = int(combined_df["time"].max().timestamp() * 1000)
+    global_start_ms = _local_wall_time_ms(combined_df["time"].min())
+    global_end_ms = _local_wall_time_ms(combined_df["time"].max())
 
     html_content = _build_multi_animation_html(loaded_entries, float(time_scale), bounds, global_start_ms, global_end_ms)
 

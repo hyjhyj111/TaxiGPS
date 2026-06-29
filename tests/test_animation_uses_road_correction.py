@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -164,6 +165,45 @@ class AnimationRoadCorrectionTest(unittest.TestCase):
         self.assertIn('"speed": 18.0', html)
         self.assertNotIn('"speed": 120.0', html)
         self.assertIn("lerp(segment.startDisplaySpeed, segment.endDisplaySpeed", html)
+
+    def test_single_vehicle_animation_time_ms_uses_local_wall_time(self):
+        df = pd.DataFrame(
+            {
+                "time": pd.to_datetime(["2023-10-12 08:09:13", "2023-10-12 08:09:14"]),
+                "long": [114.0000, 114.0200],
+                "lati": [22.0000, 22.0000],
+                "status": [0, 0],
+                "speed": [12.0, 18.0],
+            }
+        )
+        expected_ms = int(time.mktime(pd.Timestamp("2023-10-12 08:09:13").to_pydatetime().timetuple()) * 1000)
+
+        html = map_plotter._build_animation_html("22223", df, 1.0)
+
+        self.assertIn(f'"timeMs": {expected_ms}', html)
+
+    def test_multi_vehicle_animation_time_ms_uses_local_wall_time(self):
+        df = pd.DataFrame(
+            {
+                "time": pd.to_datetime(["2023-10-12 08:09:13", "2023-10-12 08:09:14"]),
+                "long": [114.0000, 114.0200],
+                "lati": [22.0000, 22.0000],
+                "status": [0, 0],
+                "speed": [12.0, 18.0],
+            }
+        )
+        expected_ms = int(time.mktime(pd.Timestamp("2023-10-12 08:09:13").to_pydatetime().timetuple()) * 1000)
+
+        html = map_plotter._build_multi_animation_html(
+            [("22223", df, "#2563eb")],
+            1.0,
+            {"minLat": 22.0, "maxLat": 22.0, "minLng": 114.0, "maxLng": 114.02},
+            expected_ms,
+            expected_ms + 1000,
+        )
+
+        self.assertIn(f'"timeMs": {expected_ms}', html)
+        self.assertIn(f"var globalStartMs = {expected_ms};", html)
 
     def test_single_vehicle_animation_html_avoids_per_frame_path_rebuilds(self):
         df = pd.DataFrame(
