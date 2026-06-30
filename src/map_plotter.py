@@ -993,9 +993,117 @@ def add_dual_point_picker(m):
     map_name = m.get_name()
     picker_id = f"dual-route-picker-{map_name}"
     picker_html = f"""
-    <div id="{picker_id}" style="position:fixed;left:16px;bottom:18px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:260px;">
-      <div style="font-size:12px;font-weight:700;margin-bottom:4px;">连续选点</div>
-      <div data-role="coord" style="font-size:12px;color:#475569;line-height:1.45;">依次点击起点、终点；第三次点击会重新开始。</div>
+    <style>
+    #{picker_id} {{
+        position: fixed;
+        left: 16px;
+        bottom: 18px;
+        z-index: 9999;
+        background: linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(249,250,251,0.98) 100%);
+        border: 2px solid rgba(59,130,246,0.3);
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 20px 40px rgba(15,23,42,0.15), 0 0 0 1px rgba(255,255,255,0.5) inset;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        color: #0f172a;
+        min-width: 320px;
+        max-width: 380px;
+        transition: all 0.3s ease;
+    }}
+    #{picker_id}:hover {{
+        box-shadow: 0 24px 48px rgba(15,23,42,0.2), 0 0 0 1px rgba(255,255,255,0.5) inset;
+        border-color: rgba(59,130,246,0.5);
+    }}
+    #{picker_id} .header {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 8px;
+        color: #1e40af;
+    }}
+    #{picker_id} .header .icon {{
+        font-size: 18px;
+    }}
+    #{picker_id} [data-role="coord"] {{
+        font-size: 12px;
+        color: #475569;
+        line-height: 1.6;
+        margin-bottom: 10px;
+        padding: 10px;
+        background: rgba(241,245,249,0.7);
+        border-radius: 8px;
+        border-left: 3px solid #3b82f6;
+    }}
+    #{picker_id} [data-role="coord"] strong {{
+        color: #1e293b;
+        font-weight: 700;
+        font-family: 'Monaco', 'Courier New', monospace;
+        background: rgba(255,255,255,0.8);
+        padding: 2px 6px;
+        border-radius: 4px;
+    }}
+    #{picker_id} [data-role="buttons"] {{
+        display: none;
+        gap: 6px;
+        flex-wrap: wrap;
+    }}
+    #{picker_id} [data-role="buttons"].show {{
+        display: flex;
+    }}
+    #{picker_id} button {{
+        flex: 1;
+        min-width: 90px;
+        padding: 8px 12px;
+        font-size: 11px;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.2s ease;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+    }}
+    #{picker_id} button:hover {{
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+    }}
+    #{picker_id} button:active {{
+        transform: translateY(0);
+    }}
+    #{picker_id} [data-role="copy-origin"] {{
+        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    }}
+    #{picker_id} [data-role="copy-dest"] {{
+        background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    }}
+    #{picker_id} [data-role="copy-both"] {{
+        background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
+        flex-basis: 100%;
+    }}
+    #{picker_id} .tip {{
+        font-size: 10px;
+        color: #94a3b8;
+        margin-top: 8px;
+        text-align: center;
+        font-style: italic;
+    }}
+    </style>
+    <div id="{picker_id}">
+      <div class="header">
+        <span class="icon">📍</span>
+        <span>地图选点助手</span>
+      </div>
+      <div data-role="coord">💡 依次点击地图选择起点、终点<br>第三次点击会重新开始</div>
+      <div data-role="buttons">
+        <button data-role="copy-origin">📋 复制起点</button>
+        <button data-role="copy-dest">📋 复制终点</button>
+        <button data-role="copy-both">📦 复制全部</button>
+      </div>
+      <div class="tip">💡 复制后粘贴到页面输入框中</div>
     </div>
     """
     picker_js = f"""
@@ -1007,34 +1115,110 @@ def add_dual_point_picker(m):
             return;
         }}
         var coordNode = panel.querySelector('[data-role="coord"]');
+        var buttonsNode = panel.querySelector('[data-role="buttons"]');
+        var copyOriginBtn = panel.querySelector('[data-role="copy-origin"]');
+        var copyDestBtn = panel.querySelector('[data-role="copy-dest"]');
+        var copyBothBtn = panel.querySelector('[data-role="copy-both"]');
         var points = [];
         var markers = [];
         var preview = null;
+
+        function copyToClipboard(text, btnElement) {{
+            navigator.clipboard.writeText(text).then(function() {{
+                var originalText = btnElement.textContent;
+                var originalBg = btnElement.style.background;
+                btnElement.textContent = '✓ 已复制';
+                btnElement.style.background = 'linear-gradient(135deg, #059669 0%, #047857 100%)';
+                btnElement.style.transform = 'scale(1.05)';
+                setTimeout(function() {{
+                    btnElement.textContent = originalText;
+                    btnElement.style.background = '';
+                    btnElement.style.transform = '';
+                }}, 1800);
+            }}).catch(function(err) {{
+                btnElement.textContent = '❌ 失败';
+                btnElement.style.background = 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)';
+                setTimeout(function() {{
+                    btnElement.textContent = btnElement.getAttribute('data-original-text');
+                    btnElement.style.background = '';
+                }}, 1800);
+            }});
+        }}
+
         function clearSelection() {{
             markers.forEach(function(marker) {{ map.removeLayer(marker); }});
             markers = [];
             points = [];
             if (preview) map.removeLayer(preview);
             preview = null;
+            buttonsNode.classList.remove('show');
+            coordNode.innerHTML = '💡 依次点击地图选择起点、终点<br>第三次点击会重新开始';
         }}
+
+        copyOriginBtn.addEventListener('click', function(e) {{
+            e.stopPropagation();
+            if (points.length > 0) {{
+                var text = points[0].lat.toFixed(6) + ',' + points[0].lng.toFixed(6);
+                copyToClipboard(text, copyOriginBtn);
+            }}
+        }});
+
+        copyDestBtn.addEventListener('click', function(e) {{
+            e.stopPropagation();
+            if (points.length > 1) {{
+                var text = points[1].lat.toFixed(6) + ',' + points[1].lng.toFixed(6);
+                copyToClipboard(text, copyDestBtn);
+            }}
+        }});
+
+        copyBothBtn.addEventListener('click', function(e) {{
+            e.stopPropagation();
+            if (points.length > 1) {{
+                var text = points[0].lat.toFixed(6) + ',' + points[0].lng.toFixed(6) + '\\n' + points[1].lat.toFixed(6) + ',' + points[1].lng.toFixed(6);
+                copyToClipboard(text, copyBothBtn);
+            }}
+        }});
+
         map.on('click', function(e) {{
             if (points.length === 2) clearSelection();
             var label = points.length === 0 ? '起点' : '终点';
             var point = {{lat: e.latlng.lat, lng: e.latlng.lng}};
             points.push(point);
-            var marker = L.marker(e.latlng, {{title: label}}).addTo(map).bindTooltip(label).openTooltip();
+            var markerColor = points.length === 1 ? 'green' : 'red';
+            var markerIcon = points.length === 1 ? 'play' : 'flag';
+            var marker = L.marker(e.latlng, {{
+                title: label,
+                icon: L.icon({{
+                    iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-' + markerColor + '.png',
+                    shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+                    iconSize: [25, 41],
+                    iconAnchor: [12, 41],
+                    popupAnchor: [1, -34],
+                    shadowSize: [41, 41]
+                }})
+            }}).addTo(map).bindTooltip(label, {{permanent: true, direction: 'top'}}).openTooltip();
             markers.push(marker);
+
             if (points.length === 1) {{
-                coordNode.innerHTML = '起点 纬度: <strong>' + point.lat.toFixed(6) + '</strong><br>起点 经度: <strong>' + point.lng.toFixed(6) + '</strong><br>继续点击终点';
+                coordNode.innerHTML = '🟢 <strong>起点已选择</strong><br>' +
+                                    '纬度: <strong>' + point.lat.toFixed(6) + '</strong><br>' +
+                                    '经度: <strong>' + point.lng.toFixed(6) + '</strong><br>' +
+                                    '<span style="color:#3b82f6;font-weight:600;">→ 继续点击地图选择终点</span>';
+                buttonsNode.classList.remove('show');
                 return;
             }}
+
             preview = L.polyline([[points[0].lat, points[0].lng], [points[1].lat, points[1].lng]], {{
-                color: '#64748b',
-                weight: 3,
-                dashArray: '6,6',
-                opacity: 0.8
+                color: '#3b82f6',
+                weight: 4,
+                dashArray: '10,10',
+                opacity: 0.7
             }}).addTo(map);
-            coordNode.innerHTML = '起点: ' + points[0].lat.toFixed(6) + ', ' + points[0].lng.toFixed(6) + '<br>终点: ' + points[1].lat.toFixed(6) + ', ' + points[1].lng.toFixed(6) + '<br>将坐标填入页面可重新计算路线';
+
+            coordNode.innerHTML = '✅ <strong>起终点已选择</strong><br>' +
+                                '🟢 起点: <strong>' + points[0].lat.toFixed(6) + '</strong>, <strong>' + points[0].lng.toFixed(6) + '</strong><br>' +
+                                '🔴 终点: <strong>' + points[1].lat.toFixed(6) + '</strong>, <strong>' + points[1].lng.toFixed(6) + '</strong>';
+            buttonsNode.classList.add('show');
         }});
     }})();
     """
@@ -1083,6 +1267,48 @@ def plot_baseline_route_comparison(route_result, save_path=None):
     ensure_parent_dir(output_path)
     m.save(output_path)
     return output_path
+
+
+def build_baseline_route_map(route_result):
+    """构建路线对比地图对象（不保存文件，用于交互式渲染）"""
+    if not route_result or not route_result.get("success"):
+        return None
+
+    shortest_points = route_result.get("shortest", {}).get("points", [])
+    fastest_points = route_result.get("fastest", {}).get("points", [])
+    all_points = shortest_points + fastest_points
+    map_df = pd.DataFrame({"lati": [point[0] for point in all_points], "long": [point[1] for point in all_points]})
+    m = build_map(map_df)
+
+    if shortest_points:
+        folium.PolyLine(
+            shortest_points,
+            color="#2563eb",
+            weight=6,
+            opacity=0.86,
+            tooltip=f"最短距离路线 {route_result['shortest']['distance_m'] / 1000:.2f} km",
+        ).add_to(m)
+    if fastest_points:
+        folium.PolyLine(
+            fastest_points,
+            color="#16a34a",
+            weight=5,
+            opacity=0.9,
+            dash_array="8,6" if fastest_points == shortest_points else None,
+            tooltip=f"基准最快路线 {route_result['fastest']['route_cost_s'] / 60:.1f} min",
+        ).add_to(m)
+
+    origin = route_result.get("origin", {})
+    destination = route_result.get("destination", {})
+    if origin:
+        folium.Marker([origin["lat"], origin["lng"]], tooltip=f"起点 node={origin.get('node')}", icon=folium.Icon(color="green", icon="play")).add_to(m)
+    if destination:
+        folium.Marker([destination["lat"], destination["lng"]], tooltip=f"终点 node={destination.get('node')}", icon=folium.Icon(color="red", icon="flag")).add_to(m)
+
+    m.get_root().html.add_child(folium.Element(_baseline_route_legend_html(route_result)))
+    add_map_layers(m, include_boundary=True, include_picker=False)
+
+    return m
 
 
 def _edge_length_km(graph, source, target):

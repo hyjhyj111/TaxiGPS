@@ -39,8 +39,6 @@ from map_plotter import (  # noqa: E402
     load_od_data,
     load_vehicle_trajectory,
     estimate_eta,
-    plan_baseline_routes_between_points,
-    plot_baseline_route_comparison,
     plot_animated_trajectory,
     plot_congestion_roads,
     plot_eta_route,
@@ -58,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
-VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "路线规划", "拥堵与ETA"]
+VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "拥堵与ETA"]
 NAVIGATION_GROUPS = [
     {
         "label": "地图",
@@ -80,7 +78,6 @@ NAVIGATION_GROUPS = [
     {
         "label": "路线",
         "items": [
-            {"view": "路线规划", "icon": "🗺️"},
             {"view": "拥堵与ETA", "icon": "🚗"},
         ],
         "divider_after": False,
@@ -99,7 +96,6 @@ def get_view_context(view_name):
                     "分钟位置": "查看指定分钟的车辙分布",
                     "OD点标注": "展示上车点和下车点位置",
                     "热力图与统计分析": "静态/动态热力图、聚类与订单统计",
-                    "路线规划": "最短距离与基准最快路线规划",
                     "拥堵与ETA": "路段拥堵颜色与历史均速ETA",
                 }
                 return {
@@ -401,18 +397,6 @@ def cached_eta_result(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids, s
         start_time=start_time,
         end_time=end_time,
         bucket_minutes=bucket_minutes,
-    )
-
-
-@st.cache_data(show_spinner=False, ttl=300)
-def cached_baseline_route_result(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids, query_date):
-    return plan_baseline_routes_between_points(
-        origin_lat,
-        origin_lng,
-        dest_lat,
-        dest_lng,
-        vehicle_ids=tuple(vehicle_ids or []),
-        query_date=query_date,
     )
 
 
@@ -1470,126 +1454,6 @@ def render_congestion_eta_view(payload):
     render_html_map(eta_path, height=620)
 
 
-def render_baseline_route_view(payload):
-    st.subheader("最短距离与基准最快路线")
-    selected_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
-    status = road_network_status()
-    if status["available"]:
-        st.caption(f"路网文件: {status['path']}")
-    else:
-        st.warning("未找到路网文件。请将 shenzhen_drive.pkl 或 shenzhen_drive.graphml 放到项目根目录、data/ 或 cache/，或设置 TAXIGPS_ROAD_NETWORK_PATH。")
-        return
-
-    if not selected_vehicle_ids:
-        st.info("未选择车辆时，基准最快路线会使用道路类型默认速度；选择车辆后会从车辆缓存生成全日道路边平均速度样本。")
-    elif len(selected_vehicle_ids) > CONFIG["MAX_CONGESTION_VEHICLES"]:
-        st.warning(f"基准速度样本将使用前 {CONFIG['MAX_CONGESTION_VEHICLES']} 辆车，避免一次查询处理过多轨迹。")
-    speed_vehicle_ids = selected_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
-
-    mode = st.radio(
-        "起终点来源",
-        ["手动坐标", "历史OD端点"],
-        horizontal=True,
-        key="route_source_mode",
-        help="历史OD端点来自当前查询窗口；地图中的连续选点面板可辅助读取坐标后填入手动坐标。",
-    )
-
-    origin_lat = float(st.session_state.get("route_origin_lat", CONFIG["MAP_CENTER"][0]))
-    origin_lng = float(st.session_state.get("route_origin_lng", CONFIG["MAP_CENTER"][1]))
-    dest_lat = float(st.session_state.get("route_dest_lat", 22.6008))
-    dest_lng = float(st.session_state.get("route_dest_lng", 114.1010))
-    od_row = None
-
-    if mode == "历史OD端点":
-        od_df = load_od_data(payload["start_time"], payload["end_time"], vehicle_ids=speed_vehicle_ids or None)
-        if od_df is None or len(od_df) == 0:
-            st.warning("当前查询窗口没有可用 OD 记录，请切换到手动坐标或调整时间/车辆。")
-        else:
-            max_options = min(50, len(od_df))
-            od_options = list(range(max_options))
-            selected_index = st.selectbox(
-                "历史 OD 样例",
-                od_options,
-                key="route_od_index",
-                format_func=lambda idx: (
-                    f"{od_df.iloc[idx]['O_TAXI_ID']} | "
-                    f"{od_df.iloc[idx]['O_time'].strftime('%H:%M:%S')} -> {od_df.iloc[idx]['D_time'].strftime('%H:%M:%S')} | "
-                    f"{od_df.iloc[idx]['OD_Dist_km']:.2f} km"
-                ),
-            )
-            od_row = od_df.iloc[int(selected_index)]
-            origin_lat = float(od_row["O_lat"])
-            origin_lng = float(od_row["O_lng"])
-            dest_lat = float(od_row["D_lat"])
-            dest_lng = float(od_row["D_lng"])
-            st.caption("OD 原始坐标会保留；路线计算会额外吸附到最近路网节点。")
-    else:
-        route_cols = st.columns(4)
-        with route_cols[0]:
-            origin_lat = st.number_input("起点纬度", format="%.6f", key="route_origin_lat")
-        with route_cols[1]:
-            origin_lng = st.number_input("起点经度", format="%.6f", key="route_origin_lng")
-        with route_cols[2]:
-            dest_lat = st.number_input("终点纬度", format="%.6f", key="route_dest_lat")
-        with route_cols[3]:
-            dest_lng = st.number_input("终点经度", format="%.6f", key="route_dest_lng")
-
-    with st.spinner("正在生成全日道路基准速度并计算最短/最快路线..."):
-        route_result = cached_baseline_route_result(
-            origin_lat,
-            origin_lng,
-            dest_lat,
-            dest_lng,
-            speed_vehicle_ids,
-            payload["start_time"].date(),
-        )
-
-    if not route_result.get("success"):
-        st.error(route_result.get("error", "路线计算失败。"))
-        return
-
-    shortest = route_result["shortest"]
-    fastest = route_result["fastest"]
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("最短距离", f"{shortest['distance_m'] / 1000:.2f} km")
-    metric_cols[1].metric("最快路线距离", f"{fastest['distance_m'] / 1000:.2f} km")
-    metric_cols[2].metric("最快路线成本", f"{fastest['route_cost_s'] / 60:.1f} 分钟")
-    metric_cols[3].metric("可靠速度边", route_result.get("speed_meta", {}).get("reliable_edges", 0))
-
-    summary_df = pd.DataFrame(
-        [
-            {
-                "路线": "最短距离",
-                "道路边数": shortest["edge_count"],
-                "距离(km)": round(shortest["distance_m"] / 1000, 3),
-                "基准成本(分钟)": round(shortest["route_cost_s"] / 60, 2),
-                "节点数": len(shortest["nodes"]),
-            },
-            {
-                "路线": "基准最快",
-                "道路边数": fastest["edge_count"],
-                "距离(km)": round(fastest["distance_m"] / 1000, 3),
-                "基准成本(分钟)": round(fastest["route_cost_s"] / 60, 2),
-                "节点数": len(fastest["nodes"]),
-            },
-        ]
-    )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-    if od_row is not None:
-        od_summary = pd.DataFrame(
-            [
-                {"字段": "车辆", "值": od_row["O_TAXI_ID"]},
-                {"字段": "上车原始坐标", "值": f"{od_row['O_lat']:.6f}, {od_row['O_lng']:.6f}"},
-                {"字段": "下车原始坐标", "值": f"{od_row['D_lat']:.6f}, {od_row['D_lng']:.6f}"},
-                {"字段": "上车吸附节点", "值": route_result["origin"]["node"]},
-                {"字段": "下车吸附节点", "值": route_result["destination"]["node"]},
-            ]
-        )
-        st.dataframe(od_summary, use_container_width=True, hide_index=True)
-
-    st.caption(route_result.get("method", ""))
-    route_path = plot_baseline_route_comparison(route_result)
-    render_html_map(route_path, height=700)
 
 
 def main():
@@ -1634,8 +1498,6 @@ def main():
             render_od_view(active_payload)
         elif active_view == "热力图与统计分析":
             render_heatmap_stats_view(active_payload)
-        elif active_view == "路线规划":
-            render_baseline_route_view(active_payload)
         elif active_view == "拥堵与ETA":
             render_congestion_eta_view(active_payload)
 
