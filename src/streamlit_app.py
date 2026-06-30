@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_TITLE = "出租车GPS轨迹查询系统"
 PAGE_ICON = "🚕"
-VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "拥堵与ETA"]
+VIEW_OPTIONS = ["轨迹查询", "动画轨迹", "分钟位置", "OD点标注", "热力图与统计分析", "路线规划", "拥堵与ETA"]
 NAVIGATION_GROUPS = [
     {
         "label": "地图",
@@ -78,6 +78,7 @@ NAVIGATION_GROUPS = [
     {
         "label": "路线",
         "items": [
+            {"view": "路线规划", "icon": "🗺️"},
             {"view": "拥堵与ETA", "icon": "🚗"},
         ],
         "divider_after": False,
@@ -96,6 +97,7 @@ def get_view_context(view_name):
                     "分钟位置": "查看指定分钟的车辙分布",
                     "OD点标注": "展示上车点和下车点位置",
                     "热力图与统计分析": "静态/动态热力图、聚类与订单统计",
+                    "路线规划": "地图选点计算最短距离与基准最快路线",
                     "拥堵与ETA": "路段拥堵颜色与历史均速ETA",
                 }
                 return {
@@ -1498,6 +1500,9 @@ def main():
             render_od_view(active_payload)
         elif active_view == "热力图与统计分析":
             render_heatmap_stats_view(active_payload)
+        elif active_view == "路线规划":
+            from route_planner import render_route_planning_view
+            render_route_planning_view(active_payload)
         elif active_view == "拥堵与ETA":
             render_congestion_eta_view(active_payload)
 
