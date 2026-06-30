@@ -219,6 +219,126 @@ def render_route_planning_view(payload):
         st.session_state.route_points = []
     if 'route_result' not in st.session_state:
         st.session_state.route_result = None
+    if 'route_source_mode' not in st.session_state:
+        st.session_state.route_source_mode = "地图选点"
+
+    # 起终点来源选择
+    st.markdown("### 📍 选择起终点")
+
+    mode_col1, mode_col2 = st.columns(2)
+    with mode_col1:
+        if st.button("🗺️ 地图选点", use_container_width=True,
+                     type="primary" if st.session_state.route_source_mode == "地图选点" else "secondary"):
+            st.session_state.route_source_mode = "地图选点"
+            st.session_state.route_points = []
+            st.session_state.route_result = None
+            st.rerun()
+
+    with mode_col2:
+        if st.button("📋 历史OD端点", use_container_width=True,
+                     type="primary" if st.session_state.route_source_mode == "历史OD端点" else "secondary"):
+            st.session_state.route_source_mode = "历史OD端点"
+            st.session_state.route_points = []
+            st.session_state.route_result = None
+            st.rerun()
+
+    # 根据模式显示不同的界面
+    if st.session_state.route_source_mode == "历史OD端点":
+        render_od_selection_mode(payload, speed_vehicle_ids)
+    else:
+        render_map_selection_mode(payload, speed_vehicle_ids)
+
+
+def render_od_selection_mode(payload, speed_vehicle_ids):
+    """历史 OD 端点选择模式"""
+    from map_plotter import load_od_data
+
+    st.info("💡 从历史订单中选择起终点，系统会使用订单的上下车点计算路线。")
+
+    # 加载 OD 数据
+    with st.spinner("正在加载历史 OD 数据..."):
+        od_df = load_od_data(
+            payload["start_time"],
+            payload["end_time"],
+            vehicle_ids=speed_vehicle_ids or None
+        )
+
+    if od_df is None or len(od_df) == 0:
+        st.warning("当前时间范围内没有可用的 OD 记录，请调整时间范围或车辆选择。")
+        return
+
+    st.success(f"✅ 找到 {len(od_df)} 条 OD 记录")
+
+    # 选择订单
+    max_options = min(100, len(od_df))
+    od_options = list(range(max_options))
+
+    selected_index = st.selectbox(
+        "选择历史订单",
+        od_options,
+        format_func=lambda idx: (
+            f"订单 {idx+1}: 车辆 {od_df.iloc[idx]['O_TAXI_ID']} | "
+            f"{od_df.iloc[idx]['O_time'].strftime('%H:%M:%S')} → "
+            f"{od_df.iloc[idx]['D_time'].strftime('%H:%M:%S')} | "
+            f"{od_df.iloc[idx].get('OD_Dist_km', 0):.2f} km"
+        ),
+        key="route_od_selector"
+    )
+
+    if selected_index is not None:
+        selected_od = od_df.iloc[int(selected_index)]
+
+        # 显示订单详情
+        st.markdown("#### 📊 订单详情")
+        detail_cols = st.columns(4)
+        detail_cols[0].metric("车辆ID", selected_od['O_TAXI_ID'])
+        detail_cols[1].metric("上车时间", selected_od['O_time'].strftime('%H:%M:%S'))
+        detail_cols[2].metric("下车时间", selected_od['D_time'].strftime('%H:%M:%S'))
+        detail_cols[3].metric("行驶距离", f"{selected_od.get('OD_Dist_km', 0):.2f} km")
+
+        coord_cols = st.columns(2)
+        with coord_cols[0]:
+            st.caption("**上车点坐标**")
+            st.text(f"纬度: {selected_od['O_lat']:.6f}")
+            st.text(f"经度: {selected_od['O_lng']:.6f}")
+
+        with coord_cols[1]:
+            st.caption("**下车点坐标**")
+            st.text(f"纬度: {selected_od['D_lat']:.6f}")
+            st.text(f"经度: {selected_od['D_lng']:.6f}")
+
+        # 计算路线按钮
+        if st.button("✅ 计算路线", type="primary", use_container_width=True):
+            with st.spinner("正在生成全日道路基准速度并计算最短/最快路线..."):
+                route_result = plan_baseline_routes_between_points(
+                    selected_od['O_lat'],
+                    selected_od['O_lng'],
+                    selected_od['D_lat'],
+                    selected_od['D_lng'],
+                    vehicle_ids=tuple(speed_vehicle_ids or []),
+                    query_date=payload["start_time"].date(),
+                )
+
+            if route_result.get("success"):
+                st.session_state.route_result = route_result
+                # 保存起终点用于地图显示
+                st.session_state.route_points = [
+                    {'lat': selected_od['O_lat'], 'lng': selected_od['O_lng']},
+                    {'lat': selected_od['D_lat'], 'lng': selected_od['D_lng']}
+                ]
+                st.success("✅ 路线计算完成！")
+                st.rerun()
+            else:
+                st.error(f"路线计算失败: {route_result.get('error', '未知错误')}")
+
+        # 显示地图和统计信息
+        if st.session_state.route_result and st.session_state.route_result.get("success"):
+            display_route_map_and_stats(selected_od)
+
+
+def render_map_selection_mode(payload, speed_vehicle_ids):
+    """地图选点模式"""
+    st.info("💡 点击地图依次选择起点和终点")
 
     # 操作按钮
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -328,44 +448,76 @@ def render_route_planning_view(payload):
 
     # 显示路线统计信息
     if st.session_state.route_result and st.session_state.route_result.get("success"):
-        st.markdown("---")
-        st.markdown("### 📊 路线统计")
+        display_route_map_and_stats(None)
 
-        result = st.session_state.route_result
-        shortest = result["shortest"]
-        fastest = result["fastest"]
 
-        # 指标卡片
-        metric_cols = st.columns(4)
-        metric_cols[0].metric("最短距离", f"{shortest['distance_m'] / 1000:.2f} km")
-        metric_cols[1].metric("最快路线距离", f"{fastest['distance_m'] / 1000:.2f} km")
-        metric_cols[2].metric("预计时间", f"{fastest['route_cost_s'] / 60:.1f} 分钟")
-        metric_cols[3].metric("可靠速度边", result.get("speed_meta", {}).get("reliable_edges", 0))
+def display_route_map_and_stats(selected_od=None):
+    """显示路线地图和统计信息"""
+    st.markdown("---")
+    st.markdown("### 📊 路线统计")
 
-        # 详细统计表
-        summary_df = pd.DataFrame([
-            {
-                "路线": "最短距离",
-                "道路边数": shortest["edge_count"],
-                "距离(km)": round(shortest["distance_m"] / 1000, 3),
-                "基准成本(分钟)": round(shortest["route_cost_s"] / 60, 2),
-                "节点数": len(shortest["nodes"]),
-            },
-            {
-                "路线": "基准最快",
-                "道路边数": fastest["edge_count"],
-                "距离(km)": round(fastest["distance_m"] / 1000, 3),
-                "基准成本(分钟)": round(fastest["route_cost_s"] / 60, 2),
-                "节点数": len(fastest["nodes"]),
-            },
-        ])
-        st.dataframe(summary_df, width="stretch", hide_index=True)
+    result = st.session_state.route_result
+    shortest = result["shortest"]
+    fastest = result["fastest"]
 
-        # 元信息
-        speed_meta = result.get("speed_meta", {})
-        st.caption(
-            f"路网节点: {result.get('network', {}).get('nodes', 0)} | "
-            f"路网边数: {result.get('network', {}).get('edges', 0)} | "
-            f"速度样本边: {speed_meta.get('edge_rows', 0)} | "
-            f"可靠速度边: {speed_meta.get('reliable_edges', 0)}"
+    # 指标卡片
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("最短距离", f"{shortest['distance_m'] / 1000:.2f} km")
+    metric_cols[1].metric("最快路线距离", f"{fastest['distance_m'] / 1000:.2f} km")
+    metric_cols[2].metric("预计时间", f"{fastest['route_cost_s'] / 60:.1f} 分钟")
+    metric_cols[3].metric("可靠速度边", result.get("speed_meta", {}).get("reliable_edges", 0))
+
+    # 详细统计表
+    summary_df = pd.DataFrame([
+        {
+            "路线": "最短距离",
+            "道路边数": shortest["edge_count"],
+            "距离(km)": round(shortest["distance_m"] / 1000, 3),
+            "基准成本(分钟)": round(shortest["route_cost_s"] / 60, 2),
+            "节点数": len(shortest["nodes"]),
+        },
+        {
+            "路线": "基准最快",
+            "道路边数": fastest["edge_count"],
+            "距离(km)": round(fastest["distance_m"] / 1000, 3),
+            "基准成本(分钟)": round(fastest["route_cost_s"] / 60, 2),
+            "节点数": len(fastest["nodes"]),
+        },
+    ])
+    st.dataframe(summary_df, width="stretch", hide_index=True)
+
+    # 如果是从 OD 选择的，显示对比信息
+    if selected_od is not None:
+        st.markdown("#### 🔍 实际 vs 规划对比")
+        compare_cols = st.columns(3)
+
+        actual_distance = selected_od.get('OD_Dist_km', 0)
+        planned_distance = fastest['distance_m'] / 1000
+        distance_diff = actual_distance - planned_distance
+
+        compare_cols[0].metric(
+            "实际行驶距离",
+            f"{actual_distance:.2f} km",
+            delta=f"{distance_diff:+.2f} km" if actual_distance > 0 else None
         )
+        compare_cols[1].metric(
+            "规划最快距离",
+            f"{planned_distance:.2f} km"
+        )
+
+        if actual_distance > 0:
+            detour_ratio = (distance_diff / planned_distance) * 100
+            compare_cols[2].metric(
+                "绕路率",
+                f"{detour_ratio:+.1f}%",
+                delta="可能绕路" if detour_ratio > 10 else "路线合理"
+            )
+
+    # 元信息
+    speed_meta = result.get("speed_meta", {})
+    st.caption(
+        f"路网节点: {result.get('network', {}).get('nodes', 0)} | "
+        f"路网边数: {result.get('network', {}).get('edges', 0)} | "
+        f"速度样本边: {speed_meta.get('edge_rows', 0)} | "
+        f"可靠速度边: {speed_meta.get('reliable_edges', 0)}"
+    )
