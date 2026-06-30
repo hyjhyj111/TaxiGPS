@@ -362,7 +362,31 @@ def render_od_selection_mode(payload, speed_vehicle_ids):
             else:
                 st.error(f"路线计算失败: {route_result.get('error', '未知错误')}")
 
-        # 显示地图和统计信息
+        # 创建地图（即使没有计算路线也显示起终点）
+        st.markdown("---")
+        st.markdown("### 🗺️ 地图预览")
+
+        # 设置起终点用于地图显示
+        preview_points = [
+            {'lat': selected_od['O_lat'], 'lng': selected_od['O_lng']},
+            {'lat': selected_od['D_lat'], 'lng': selected_od['D_lng']}
+        ]
+
+        # 创建地图
+        route_map = create_interactive_route_map(
+            preview_points,
+            st.session_state.route_result
+        )
+
+        # 渲染地图
+        st_folium(
+            route_map,
+            width=None,
+            height=600,
+            key=f"route_od_map_{selected_index}_{st.session_state.get('route_result') is not None}"
+        )
+
+        # 显示路线统计信息
         if st.session_state.route_result and st.session_state.route_result.get("success"):
             display_route_map_and_stats(selected_od)
 
