@@ -158,7 +158,7 @@ def render_route_planning_view(payload):
     col1, col2, col3 = st.columns([1, 1, 2])
 
     with col1:
-        if st.button("🔄 重新选点", use_container_width=True):
+        if st.button("🔄 重新选点", width="stretch"):
             st.session_state.route_points = []
             st.session_state.route_result = None
             # 清除地图视图状态，重置为默认视图
@@ -172,7 +172,7 @@ def render_route_planning_view(payload):
         can_calculate = len(st.session_state.route_points) == 2
         if st.button(
             "✅ 计算路线",
-            use_container_width=True,
+            width="stretch",
             type="primary" if can_calculate else "secondary",
             disabled=not can_calculate
         ):
@@ -293,7 +293,7 @@ def render_route_planning_view(payload):
                 "节点数": len(fastest["nodes"]),
             },
         ])
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
 
         # 元信息
         speed_meta = result.get("speed_meta", {})
