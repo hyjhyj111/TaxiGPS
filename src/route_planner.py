@@ -124,6 +124,72 @@ def create_interactive_route_map(points, route_result=None):
                 tooltip=f"基准最快路线 {fastest['route_cost_s'] / 60:.1f} min",
             ).add_to(m)
 
+        # 添加图例
+        legend_html = f"""
+        <div style="position: fixed;
+                    top: 10px;
+                    right: 10px;
+                    z-index: 9999;
+                    background: white;
+                    padding: 15px 20px;
+                    border: 2px solid #ccc;
+                    border-radius: 8px;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    font-family: Arial, sans-serif;
+                    font-size: 14px;
+                    min-width: 200px;">
+            <div style="font-weight: bold;
+                        margin-bottom: 12px;
+                        font-size: 16px;
+                        color: #333;
+                        border-bottom: 2px solid #e5e7eb;
+                        padding-bottom: 8px;">
+                📍 路线图例
+            </div>
+
+            <div style="margin-bottom: 10px;
+                        display: flex;
+                        align-items: center;">
+                <div style="width: 40px;
+                            height: 5px;
+                            background-color: #2563eb;
+                            margin-right: 10px;
+                            border-radius: 2px;"></div>
+                <span style="color: #1e40af; font-weight: 600;">最短距离路线</span>
+            </div>
+
+            <div style="margin-bottom: 10px;
+                        font-size: 12px;
+                        color: #6b7280;
+                        margin-left: 50px;">
+                距离：{shortest['distance_m'] / 1000:.2f} km<br>
+                道路边：{shortest['edge_count']} 条
+            </div>
+
+            <div style="margin-bottom: 10px;
+                        display: flex;
+                        align-items: center;">
+                <div style="width: 40px;
+                            height: 5px;
+                            background-color: #16a34a;
+                            margin-right: 10px;
+                            border-radius: 2px;"></div>
+                <span style="color: #15803d; font-weight: 600;">基准最快路线</span>
+            </div>
+
+            <div style="font-size: 12px;
+                        color: #6b7280;
+                        margin-left: 50px;">
+                距离：{fastest['distance_m'] / 1000:.2f} km<br>
+                时间：{fastest['route_cost_s'] / 60:.1f} 分钟<br>
+                道路边：{fastest['edge_count']} 条
+            </div>
+
+            {'<div style="margin-top: 12px; padding-top: 10px; border-top: 1px solid #e5e7eb; font-size: 11px; color: #9ca3af;">⚠️ 两条路线相同</div>' if fastest['points'] == shortest['points'] else ''}
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
     return m
 
 
