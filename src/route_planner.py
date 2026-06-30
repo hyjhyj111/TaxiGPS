@@ -31,7 +31,7 @@ def create_interactive_route_map(points, route_result=None):
     # 确定地图中心和缩放级别
     # 优先使用已保存的视图状态，避免选点时地图跳动
     if 'map_view_center' in st.session_state and 'map_view_zoom' in st.session_state:
-        # 使用保存的视图状态
+        # 使用保存的视图状态（用户当前看到的位置）
         map_center = st.session_state.map_view_center
         map_zoom = st.session_state.map_view_zoom
     elif route_result and route_result.get("success"):
@@ -46,29 +46,21 @@ def create_interactive_route_map(points, route_result=None):
             })
             # 计算合适的中心点和缩放级别
             map_center = [map_df["lati"].mean(), map_df["long"].mean()]
-            # 保存视图状态
-            st.session_state.map_view_center = map_center
-            st.session_state.map_view_zoom = 13
             map_zoom = 13
         else:
             map_center = CONFIG["MAP_CENTER"]
             map_zoom = 12
     elif points:
-        # 只有选点时，使用选点的中心
+        # 有选点但没有保存的视图状态时，才使用选点的中心
+        # 这只在第一次选点时发生
         center_lat = sum(p['lat'] for p in points) / len(points)
         center_lng = sum(p['lng'] for p in points) / len(points)
         map_center = [center_lat, center_lng]
         map_zoom = 13
-        # 保存视图状态
-        st.session_state.map_view_center = map_center
-        st.session_state.map_view_zoom = map_zoom
     else:
-        # 默认视图
+        # 默认视图（没有选点，没有路线，没有保存的视图）
         map_center = CONFIG["MAP_CENTER"]
         map_zoom = 12
-        # 保存视图状态
-        st.session_state.map_view_center = map_center
-        st.session_state.map_view_zoom = map_zoom
 
     # 创建地图
     m = folium.Map(
@@ -221,12 +213,22 @@ def render_route_planning_view(payload):
     )
 
     # 渲染地图并捕获点击事件
+    # 使用返回的 map_data 中的 center 和 zoom 来保存当前视图
     map_data = st_folium(
         route_map,
         width=None,
         height=600,
-        key=f"route_map_{len(st.session_state.route_points)}_{st.session_state.get('route_result') is not None}"
+        key=f"route_map_{len(st.session_state.route_points)}_{st.session_state.get('route_result') is not None}",
+        returned_objects=["last_clicked"]
     )
+
+    # 保存当前地图的视图状态（从 map_data 中获取）
+    if map_data:
+        # 如果地图返回了中心点和缩放级别，保存它们
+        if map_data.get("center"):
+            st.session_state.map_view_center = [map_data["center"]["lat"], map_data["center"]["lng"]]
+        if map_data.get("zoom"):
+            st.session_state.map_view_zoom = map_data["zoom"]
 
     # 处理地图点击事件
     if map_data and map_data.get("last_clicked"):
