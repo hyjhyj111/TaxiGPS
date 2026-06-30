@@ -28,9 +28,14 @@ def create_interactive_route_map(points, route_result=None):
     Returns:
         folium.Map 对象
     """
-    # 确定地图中心
-    if route_result and route_result.get("success"):
-        # 使用路线结果中的点
+    # 确定地图中心和缩放级别
+    # 优先使用已保存的视图状态，避免选点时地图跳动
+    if 'map_view_center' in st.session_state and 'map_view_zoom' in st.session_state:
+        # 使用保存的视图状态
+        map_center = st.session_state.map_view_center
+        map_zoom = st.session_state.map_view_zoom
+    elif route_result and route_result.get("success"):
+        # 有路线结果时，使用路线的边界来确定视图
         shortest_points = route_result.get("shortest", {}).get("points", [])
         fastest_points = route_result.get("fastest", {}).get("points", [])
         all_points = shortest_points + fastest_points
@@ -39,29 +44,38 @@ def create_interactive_route_map(points, route_result=None):
                 "lati": [p[0] for p in all_points],
                 "long": [p[1] for p in all_points]
             })
-            m = build_map(map_df)
+            # 计算合适的中心点和缩放级别
+            map_center = [map_df["lati"].mean(), map_df["long"].mean()]
+            # 保存视图状态
+            st.session_state.map_view_center = map_center
+            st.session_state.map_view_zoom = 13
+            map_zoom = 13
         else:
-            m = folium.Map(
-                location=CONFIG["MAP_CENTER"],
-                zoom_start=12,
-                tiles='OpenStreetMap'
-            )
+            map_center = CONFIG["MAP_CENTER"]
+            map_zoom = 12
     elif points:
-        # 使用已选择的点
+        # 只有选点时，使用选点的中心
         center_lat = sum(p['lat'] for p in points) / len(points)
         center_lng = sum(p['lng'] for p in points) / len(points)
-        m = folium.Map(
-            location=[center_lat, center_lng],
-            zoom_start=13,
-            tiles='OpenStreetMap'
-        )
+        map_center = [center_lat, center_lng]
+        map_zoom = 13
+        # 保存视图状态
+        st.session_state.map_view_center = map_center
+        st.session_state.map_view_zoom = map_zoom
     else:
-        # 使用默认中心
-        m = folium.Map(
-            location=CONFIG["MAP_CENTER"],
-            zoom_start=12,
-            tiles='OpenStreetMap'
-        )
+        # 默认视图
+        map_center = CONFIG["MAP_CENTER"]
+        map_zoom = 12
+        # 保存视图状态
+        st.session_state.map_view_center = map_center
+        st.session_state.map_view_zoom = map_zoom
+
+    # 创建地图
+    m = folium.Map(
+        location=map_center,
+        zoom_start=map_zoom,
+        tiles='OpenStreetMap'
+    )
 
     # 添加已选择的点标记
     if len(points) >= 1:
@@ -155,6 +169,11 @@ def render_route_planning_view(payload):
         if st.button("🔄 重新选点", use_container_width=True):
             st.session_state.route_points = []
             st.session_state.route_result = None
+            # 清除地图视图状态，重置为默认视图
+            if 'map_view_center' in st.session_state:
+                del st.session_state.map_view_center
+            if 'map_view_zoom' in st.session_state:
+                del st.session_state.map_view_zoom
             st.rerun()
 
     with col2:
@@ -225,6 +244,11 @@ def render_route_planning_view(payload):
             if len(st.session_state.route_points) >= 2:
                 st.session_state.route_points = []
                 st.session_state.route_result = None
+                # 清除地图视图状态，重置为默认视图
+                if 'map_view_center' in st.session_state:
+                    del st.session_state.map_view_center
+                if 'map_view_zoom' in st.session_state:
+                    del st.session_state.map_view_zoom
 
             # 添加新点
             st.session_state.route_points.append({
