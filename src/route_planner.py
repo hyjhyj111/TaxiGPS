@@ -255,19 +255,50 @@ def render_od_selection_mode(payload, speed_vehicle_ids):
 
     st.info("💡 从历史订单中选择起终点，系统会使用订单的上下车点计算路线。")
 
+    # 检查是否选择了车辆
+    if not speed_vehicle_ids:
+        st.warning("⚠️ 请先在侧边栏选择车辆，系统将从这些车辆中加载历史订单。")
+        st.info("**提示：** 不是所有车辆都有订单数据。有轨迹数据的车辆不一定有载客订单记录。")
+        return
+
     # 加载 OD 数据
     with st.spinner("正在加载历史 OD 数据..."):
         od_df = load_od_data(
             payload["start_time"],
             payload["end_time"],
-            vehicle_ids=speed_vehicle_ids or None
+            vehicle_ids=speed_vehicle_ids
         )
 
     if od_df is None or len(od_df) == 0:
-        st.warning("当前时间范围内没有可用的 OD 记录，请调整时间范围或车辆选择。")
+        st.warning("⚠️ 当前时间范围内没有找到订单记录")
+
+        # 显示诊断信息
+        st.markdown("### 🔍 可能的原因")
+        st.markdown(f"""
+        1. **选中的车辆在该时间段没有订单**
+           - 当前选择：{', '.join(speed_vehicle_ids[:5])}{'...' if len(speed_vehicle_ids) > 5 else ''}
+           - 时间范围：{payload["start_time"].strftime('%Y-%m-%d %H:%M')} - {payload["end_time"].strftime('%H:%M')}
+
+        2. **车辆只有轨迹数据，没有订单数据**
+           - 车辆可能只是空驶，未产生载客订单
+           - OD 表只记录有上下车的订单
+
+        3. **建议操作：**
+           - 尝试选择其他车辆（如：22223, 22224, 22228, 22230）
+           - 扩大时间范围（如：00:00 - 23:59）
+           - 增加更多车辆
+        """)
+
+        # 提供快速链接到其他功能
+        st.info("💡 **替代方案：** 使用「🗺️ 地图选点」模式手动选择起终点")
+
         return
 
     st.success(f"✅ 找到 {len(od_df)} 条 OD 记录")
+
+    # 显示统计信息
+    vehicle_count = od_df['O_TAXI_ID'].nunique()
+    st.caption(f"涉及 {vehicle_count} 辆车辆 | 时间范围：{od_df['O_time'].min().strftime('%H:%M')} - {od_df['O_time'].max().strftime('%H:%M')}")
 
     # 选择订单
     max_options = min(100, len(od_df))
