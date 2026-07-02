@@ -71,6 +71,16 @@ class StreamlitNavigationTest(unittest.TestCase):
 
         self.assertIn("动画倍速必须在 1-5 倍之间。", errors)
 
+    def test_sidebar_has_history_od_candidate_controls(self):
+        source = inspect.getsource(streamlit_app.render_history_od_sidebar_tools)
+
+        self.assertIn("查询有OD车辆", source)
+        self.assertIn("OD车辆候选", source)
+        self.assertIn("应用OD车辆", source)
+        self.assertNotIn("生成校正OD缓存", source)
+        self.assertNotIn("trajectory_vehicle_ids", source)
+        self.assertNotIn("load_od_data", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,13 @@ from map_plotter import (  # noqa: E402
     plot_vehicle_trajectory,
     road_network_status,
 )
+from order_route_analysis import (  # noqa: E402
+    filter_completed_od_orders,
+    load_completed_od_cache,
+    load_existing_od_cache,
+    normalize_vehicle_id,
+)
+from stage08_order_route_comparison import normalize_od_dataframe  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
@@ -152,6 +159,10 @@ DEFAULTS = {
     "route_dest_lng": 114.1010,
     "route_source_mode": "手动坐标",
     "route_od_index": 0,
+    "history_od_candidate_options": [],
+    "history_od_candidate_selected": [],
+    "history_od_active_vehicle_ids": [],
+    "history_od_candidate_meta": {},
 }
 
 
@@ -504,6 +515,11 @@ def build_query_payload():
     return {
         "vehicle_id": trajectory_vehicle_ids[0] if trajectory_vehicle_ids else "",
         "trajectory_vehicle_ids": trajectory_vehicle_ids,
+        "history_od_vehicle_ids": [
+            normalize_vehicle_id(vehicle_id)
+            for vehicle_id in st.session_state.get("history_od_active_vehicle_ids", [])
+            if normalize_vehicle_id(vehicle_id)
+        ],
         "start_time": start_time,
         "end_time": end_time,
         "minute_time": minute_time,
@@ -511,6 +527,127 @@ def build_query_payload():
         "ref_lat": float(st.session_state["ref_lat"]),
         "ref_lng": float(st.session_state["ref_lng"]),
     }
+
+
+def _history_od_day_range(query_date=None):
+    day = query_date or st.session_state["query_date"]
+    start_time = datetime.combine(day, time(0, 0))
+    end_time = datetime.combine(day, time(23, 59, 59))
+    return start_time, end_time
+
+
+def query_history_od_vehicle_candidates(query_date=None):
+    od_df, meta = load_completed_od_cache()
+    source_label = "校正OD缓存"
+    if not meta.get("success"):
+        od_df, meta = load_existing_od_cache()
+        source_label = "已有OD缓存"
+    if not meta.get("success"):
+        return pd.DataFrame(), {
+            "success": False,
+            "source_label": source_label,
+            "error": meta.get("error", "未找到可用OD缓存。"),
+        }
+    day_start, day_end = _history_od_day_range(query_date)
+    filtered = filter_completed_od_orders(od_df, start_time=day_start, end_time=day_end)
+    normalized = normalize_od_dataframe(filtered)
+    if len(normalized) > 0:
+        normalized = normalized[
+            normalized["vehicle_id"].notna()
+            & normalized["pickup_node"].notna()
+            & normalized["dropoff_node"].notna()
+            & normalized["pickup_time"].notna()
+            & normalized["dropoff_time"].notna()
+            & (normalized["dropoff_time"] > normalized["pickup_time"])
+        ].copy()
+
+    vehicle_cache_dir = os.path.join("cache", "vehicles")
+    cached_vehicle_ids = set()
+    if os.path.isdir(vehicle_cache_dir):
+        for filename in os.listdir(vehicle_cache_dir):
+            lower = filename.lower()
+            if lower.endswith((".csv", ".parquet")):
+                cached_vehicle_ids.add(normalize_vehicle_id(os.path.splitext(filename)[0].split("_", 1)[0]))
+
+    if len(normalized) > 0 and cached_vehicle_ids:
+        normalized = normalized[normalized["vehicle_id"].map(normalize_vehicle_id).isin(cached_vehicle_ids)].copy()
+
+    if len(normalized) == 0:
+        summary = pd.DataFrame(columns=["vehicle_id", "order_count", "first_pickup", "last_dropoff"])
+    else:
+        summary = (
+            normalized.groupby("vehicle_id", as_index=False)
+            .agg(
+                order_count=("id", "count"),
+                first_pickup=("pickup_time", "min"),
+                last_dropoff=("dropoff_time", "max"),
+            )
+            .sort_values(["order_count", "vehicle_id"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+    return summary, {
+        "success": True,
+        "source_label": source_label,
+        "cache_path": meta.get("cache_path", ""),
+        "orders": int(len(normalized)),
+        "vehicles": int(len(summary)),
+        "date": day_start.strftime("%Y-%m-%d"),
+    }
+
+
+def render_history_od_sidebar_tools():
+    st.markdown("---")
+    st.markdown("**历史OD查询**")
+
+    if st.button("查询有OD车辆", key="history_od_candidate_query", use_container_width=True):
+        candidates, meta = query_history_od_vehicle_candidates(st.session_state["query_date"])
+        if meta.get("success"):
+            options = candidates["vehicle_id"].map(normalize_vehicle_id).tolist() if len(candidates) else []
+            st.session_state["history_od_candidate_options"] = options
+            st.session_state["history_od_candidate_meta"] = meta
+            st.session_state["history_od_candidate_table"] = candidates
+            st.session_state["history_od_candidate_selected"] = options[: min(10, len(options))]
+        else:
+            st.session_state["history_od_candidate_options"] = []
+            st.session_state["history_od_candidate_selected"] = []
+            st.session_state["history_od_candidate_meta"] = meta
+
+    meta = st.session_state.get("history_od_candidate_meta", {})
+    if meta:
+        if meta.get("success"):
+            st.caption(
+                f"{meta.get('source_label')} | 车辆 {meta.get('vehicles', 0)} | "
+                f"订单 {meta.get('orders', 0)}"
+            )
+        else:
+            st.warning(meta.get("error", "OD车辆候选查询失败。"))
+
+    options = st.session_state.get("history_od_candidate_options", [])
+    current_selected = [
+        str(item)
+        for item in st.session_state.get("history_od_candidate_selected", [])
+        if str(item) in options
+    ]
+    if current_selected != st.session_state.get("history_od_candidate_selected", []):
+        st.session_state["history_od_candidate_selected"] = current_selected
+    selected = st.multiselect(
+        "OD车辆候选",
+        options=options,
+        key="history_od_candidate_selected",
+        placeholder="先点击查询有OD车辆",
+    )
+
+    if st.button("应用OD车辆", key="history_od_apply_vehicles", use_container_width=True, disabled=not selected):
+        st.session_state["history_od_active_vehicle_ids"] = [
+            normalize_vehicle_id(item)
+            for item in selected[:10]
+            if normalize_vehicle_id(item)
+        ]
+        st.session_state["route_source_mode"] = "历史OD端点"
+        st.session_state["route_points"] = []
+        st.session_state["route_result"] = None
+        st.session_state["last_query"] = build_query_payload()
+        st.rerun()
 
 
 def validate_payload(payload):
@@ -573,6 +710,9 @@ def render_sidebar():
             help="最多同时支持10车查询",
             placeholder="选择车辆ID",
         )
+
+        if active_view == "路线规划":
+            render_history_od_sidebar_tools()
 
         c1, c2 = st.columns(2)
         with c1:
