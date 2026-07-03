@@ -5,8 +5,10 @@
 支持地图点击选择起终点，计算最短距离和基准最快路线
 """
 
+import altair as alt
 import streamlit as st
 import streamlit.components.v1 as components
+import json
 import math
 import networkx as nx
 from pathlib import Path
@@ -44,6 +46,18 @@ route_click_map_component = components.declare_component(
     "route_planner_click_map",
     path=str(ROUTE_CLICK_COMPONENT_DIR),
 )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _load_route_boundary_geojson():
+    for path in CONFIG.get("BOUNDARY_PATHS", []):
+        candidate = Path(path)
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+    return None
 
 
 def _route_component_points(points):
@@ -105,12 +119,16 @@ def _route_lines_for_component(route_result):
     return shortest_points, fastest_points, shortest_label, fastest_label
 
 
-def render_route_component_map(points, route_result=None, actual_route=None, key="route_planner_map", height=600):
+def render_route_component_map(points, route_result=None, actual_route=None, key="route_planner_map", height=600, boundary_geojson=None):
     origin, destination = _route_component_points(points)
     target = "destination" if len(points or []) == 1 else "origin"
     shortest_points, fastest_points, shortest_label, fastest_label = _route_lines_for_component(route_result)
     actual_points = _component_line_points((actual_route or {}).get("points"))
-    actual_segments = _component_line_segments((actual_route or {}).get("segments"))
+    actual_segments = (
+        _component_line_segments((actual_route or {}).get("segments"))
+        if (actual_route or {}).get("has_break")
+        else []
+    )
     actual_label = ""
     if actual_points or actual_segments:
         actual_label = f"历史实际路线 {(actual_route or {}).get('distance_m', 0) / 1000:.2f} km"
@@ -131,6 +149,7 @@ def render_route_component_map(points, route_result=None, actual_route=None, key
         fastestPoints=fastest_points,
         shortestLabel=shortest_label,
         fastestLabel=fastest_label,
+        boundaryGeoJson=boundary_geojson,
         height=height,
         default=None,
         key=key,
@@ -451,11 +470,50 @@ def _best_length_edge_key(graph, u, v):
     return (0 if best_key is None else best_key), (0.0 if math.isinf(best_length) else best_length)
 
 
-def _correct_order_track_to_edges(graph, cleaned_segment, max_speed_mps=55.6, max_ratio=4.0, min_allowed_m=900.0):
+def _correct_order_track_to_edges(graph, cleaned_segment, max_speed_mps=110.0, max_ratio=8.0, min_allowed_m=1800.0):
+    """将订单窗口内的清洗轨迹点转换为连续道路边序列。
+
+    优先使用有向路网最短路；若相邻轨迹点因单行方向、局部断边或拓扑缺口
+    无法连通，则使用无向路网做短距离补桥。补桥仍恢复为真实道路边几何，
+    不使用两点直线替代。
+    """
     rows = []
-    meta = {"matched_segments": 0, "skipped_segments": 0, "path_failures": 0, "nearest_failures": 0}
+    meta = {
+        "matched_segments": 0,
+        "bridged_segments": 0,
+        "skipped_segments": 0,
+        "path_failures": 0,
+        "nearest_failures": 0,
+    }
     if graph is None or cleaned_segment is None or len(cleaned_segment) < 2:
         return pd.DataFrame(columns=["edge_u", "edge_v", "edge_key"]), meta
+
+    try:
+        undirected_graph = graph.to_undirected(as_view=True) if graph.is_directed() else graph
+    except TypeError:
+        undirected_graph = graph.to_undirected() if graph.is_directed() else graph
+
+    def build_edges_from_nodes(path_nodes):
+        segment_edges = []
+        path_distance_m = 0.0
+        for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+            if graph.get_edge_data(u, v):
+                edge_u, edge_v = u, v
+            elif graph.get_edge_data(v, u):
+                # 无向补桥时可能需要反向取边几何；仅用于历史路线展示与距离累加。
+                edge_u, edge_v = v, u
+            else:
+                continue
+            key, length = _best_length_edge_key(graph, edge_u, edge_v)
+            segment_edges.append({"edge_u": edge_u, "edge_v": edge_v, "edge_key": key})
+            path_distance_m += length
+        return segment_edges, path_distance_m
+
+    def is_plausible(path_distance_m, gps_distance_m, elapsed_s):
+        allowed_m = max(float(min_allowed_m), float(gps_distance_m) * float(max_ratio))
+        if path_distance_m <= 0:
+            return False
+        return path_distance_m <= allowed_m and path_distance_m / max(elapsed_s, 1.0) <= max_speed_mps
 
     for prev_row, row in zip(cleaned_segment.iloc[:-1].itertuples(index=False), cleaned_segment.iloc[1:].itertuples(index=False)):
         try:
@@ -469,33 +527,39 @@ def _correct_order_track_to_edges(graph, cleaned_segment, max_speed_mps=55.6, ma
 
         elapsed_s = max(float((pd.Timestamp(row.time) - pd.Timestamp(prev_row.time)).total_seconds()), 1.0)
         gps_distance_m = _haversine_m(prev_row.lati, prev_row.long, row.lati, row.long)
+
+        accepted_edges = []
+        accepted_kind = ""
         try:
             path_nodes = nx.shortest_path(graph, source, target, weight="length")
+            candidate_edges, candidate_distance_m = build_edges_from_nodes(path_nodes)
+            if candidate_edges and is_plausible(candidate_distance_m, gps_distance_m, elapsed_s):
+                accepted_edges = candidate_edges
+                accepted_kind = "matched_segments"
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             meta["path_failures"] += 1
-            continue
 
-        segment_edges = []
-        path_distance_m = 0.0
-        for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-            key, length = _best_length_edge_key(graph, u, v)
-            segment_edges.append({"edge_u": u, "edge_v": v, "edge_key": key})
-            path_distance_m += length
+        if not accepted_edges:
+            try:
+                bridge_nodes = nx.shortest_path(undirected_graph, source, target, weight="length")
+                bridge_edges, bridge_distance_m = build_edges_from_nodes(bridge_nodes)
+                if bridge_edges and is_plausible(bridge_distance_m, gps_distance_m, elapsed_s):
+                    accepted_edges = bridge_edges
+                    accepted_kind = "bridged_segments"
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                meta["path_failures"] += 1
 
-        if not segment_edges:
-            continue
-        allowed_m = max(min_allowed_m, gps_distance_m * max_ratio)
-        if path_distance_m > allowed_m or path_distance_m / elapsed_s > max_speed_mps:
+        if not accepted_edges:
             meta["skipped_segments"] += 1
             continue
-        rows.extend(segment_edges)
-        meta["matched_segments"] += 1
+
+        rows.extend(accepted_edges)
+        meta[accepted_kind] += 1
 
     edge_series = pd.DataFrame(rows, columns=["edge_u", "edge_v", "edge_key"])
     if len(edge_series) > 0:
         edge_series = edge_series[edge_series.ne(edge_series.shift()).any(axis=1)].reset_index(drop=True)
     return edge_series, meta
-
 
 def _stage08_corrected_cache_analysis_for_order(graph, order, strict_error=None):
     normalized = normalize_order(order)
@@ -526,11 +590,12 @@ def _stage08_corrected_cache_analysis_for_order(graph, order, strict_error=None)
     metrics["cleaned_track_points"] = int(len(cleaned_segment))
     metrics["gps_outlier_points"] = int(dropped_points)
     metrics["actual_used_edges"] = int(actual_meta.get("used_edges", 0))
-    metrics["actual_has_break"] = bool(actual_meta.get("has_break", False))
+    metrics["actual_has_break"] = bool(actual_meta.get("has_break", False) or correction_meta.get("skipped_segments", 0) > 0)
     metrics["actual_source"] = "订单轨迹路网校正"
     metrics["actual_cache_path"] = raw_cache_path
     metrics["strict_cache_error"] = str(strict_error) if strict_error else ""
     metrics["matched_road_segments"] = int(correction_meta.get("matched_segments", 0))
+    metrics["bridged_road_segments"] = int(correction_meta.get("bridged_segments", 0))
     metrics["skipped_road_segments"] = int(correction_meta.get("skipped_segments", 0))
     return {
         "success": True,
@@ -542,7 +607,7 @@ def _stage08_corrected_cache_analysis_for_order(graph, order, strict_error=None)
             "distance_m": actual_distance_m,
             "edge_set": set(zip(actual_edges["edge_u"], actual_edges["edge_v"], actual_edges["edge_key"])),
             "raw_point_count": int(len(raw_segment)),
-            "has_break": actual_meta.get("has_break", False),
+            "has_break": metrics.get("actual_has_break", False),
         },
         "route_result": {
             "success": True,
@@ -704,39 +769,16 @@ def render_route_planning_view(payload):
         st.session_state.route_points = []
     if 'route_result' not in st.session_state:
         st.session_state.route_result = None
-    if 'route_source_mode' not in st.session_state:
-        st.session_state.route_source_mode = "地图选点"
+    route_source_mode = st.session_state.get("route_source_mode")
+    if route_source_mode not in {"地图选点", "历史OD端点"}:
+        route_source_mode = "地图选点"
 
     history_vehicle_ids = payload.get("history_od_vehicle_ids", [])
-    if history_vehicle_ids or st.session_state.get("route_source_mode") == "历史OD端点":
+    if route_source_mode == "历史OD端点":
         render_od_selection_mode(payload, history_vehicle_ids)
         return
 
-    # 起终点来源选择
-    st.markdown("### 选择起终点")
-
-    mode_col1, mode_col2 = st.columns(2)
-    with mode_col1:
-        if st.button("地图选点", use_container_width=True,
-                     type="primary" if st.session_state.route_source_mode == "地图选点" else "secondary"):
-            st.session_state.route_source_mode = "地图选点"
-            st.session_state.route_points = []
-            st.session_state.route_result = None
-            st.rerun()
-
-    with mode_col2:
-        if st.button("历史OD端点", use_container_width=True,
-                     type="primary" if st.session_state.route_source_mode == "历史OD端点" else "secondary"):
-            st.session_state.route_source_mode = "历史OD端点"
-            st.session_state.route_points = []
-            st.session_state.route_result = None
-            st.rerun()
-
-    # 根据模式显示不同的界面
-    if st.session_state.route_source_mode == "历史OD端点":
-        render_od_selection_mode(payload, speed_vehicle_ids)
-    else:
-        render_map_selection_mode(payload, speed_vehicle_ids)
+    render_map_selection_mode(payload, speed_vehicle_ids)
 
 
 def render_od_selection_mode(payload, speed_vehicle_ids):
@@ -815,6 +857,7 @@ def render_single_vehicle_stage08_result(od_df, vehicle_id, track_cache_path):
         analysis.get("route_result") if analysis else None,
         actual_route=analysis.get("actual") if analysis else None,
         key=f"stage08_single_map_{analysis_key}",
+        boundary_geojson=_load_route_boundary_geojson(),
     )
     if analysis:
         st.markdown("### 历史订单分析")
@@ -875,6 +918,7 @@ def render_multi_vehicle_stage08_result(od_df, selected_vehicle_ids, track_cache
             top_analysis.get("route_result"),
             actual_route=top_analysis.get("actual"),
             key=f"stage08_top_detour_map_{top_order_id}",
+            boundary_geojson=_load_route_boundary_geojson(),
         )
 
     st.markdown("### 历史订单分析")
@@ -936,6 +980,8 @@ def display_stage08_metrics(analysis):
         f"清洗后点数: {metrics.get('cleaned_track_points', metrics.get('raw_track_points', 0))} | "
         f"过滤跳点: {metrics.get('gps_outlier_points', 0)} | "
         f"连续去重后边数: {metrics.get('actual_point_edges', 0)} | "
+        f"道路补桥: {metrics.get('bridged_road_segments', 0)} | "
+        f"跳过异常转移: {metrics.get('skipped_road_segments', 0)} | "
         f"起终点节点: {metrics.get('pickup_node')} -> {metrics.get('dropoff_node')}"
     )
     if metrics.get("actual_has_break"):
@@ -952,8 +998,66 @@ def display_stage08_batch_results(results):
         "平均绕行比例",
         _format_ratio(success_df["detour_ratio"].mean()) if len(success_df) and "detour_ratio" in success_df.columns else "无",
     )
+
     if len(success_df) > 0:
-        st.markdown("#### 绕行比例最高的3个订单")
+        chart_df = success_df.copy()
+        chart_df["order_label"] = chart_df["vehicle_id"].astype(str) + "-" + chart_df["order_id"].astype(str)
+        chart_df["actual_distance_km"] = pd.to_numeric(chart_df.get("actual_distance_m"), errors="coerce") / 1000.0
+        chart_df["detour_ratio_pct"] = pd.to_numeric(chart_df.get("detour_ratio"), errors="coerce") * 100.0
+        chart_df["fastest_overlap_pct"] = pd.to_numeric(chart_df.get("fastest_overlap_rate"), errors="coerce") * 100.0
+        chart_df = chart_df.replace([math.inf, -math.inf], pd.NA).dropna(
+            subset=["actual_distance_km", "detour_ratio_pct", "fastest_overlap_pct"],
+            how="all",
+        )
+
+        if len(chart_df) > 0:
+            top_chart_df = chart_df.sort_values("detour_ratio_pct", ascending=False).head(10)
+            chart_cols = st.columns([1.25, 1, 1])
+            with chart_cols[0]:
+                st.markdown("#### 绕行比例排行")
+                detour_chart = (
+                    alt.Chart(top_chart_df)
+                    .mark_bar(cornerRadiusTopRight=3, cornerRadiusBottomRight=3)
+                    .encode(
+                        x=alt.X("detour_ratio_pct:Q", title="绕行比例(%)"),
+                        y=alt.Y("order_label:N", sort="-x", title="车辆-订单"),
+                        color=alt.Color("vehicle_id:N", title="车辆"),
+                        tooltip=[
+                            alt.Tooltip("vehicle_id:N", title="车辆"),
+                            alt.Tooltip("order_id:N", title="订单"),
+                            alt.Tooltip("detour_ratio_pct:Q", title="绕行比例(%)", format=".1f"),
+                            alt.Tooltip("actual_distance_km:Q", title="实际距离(km)", format=".2f"),
+                        ],
+                    )
+                )
+                st.altair_chart(detour_chart, use_container_width=True)
+
+            with chart_cols[1]:
+                st.markdown("#### 实际距离分布")
+                distance_chart = (
+                    alt.Chart(chart_df.dropna(subset=["actual_distance_km"]))
+                    .mark_bar(color="#2563eb")
+                    .encode(
+                        x=alt.X("actual_distance_km:Q", bin=alt.Bin(maxbins=12), title="实际距离(km)"),
+                        y=alt.Y("count():Q", title="订单数"),
+                        tooltip=[alt.Tooltip("count():Q", title="订单数")],
+                    )
+                )
+                st.altair_chart(distance_chart, use_container_width=True)
+
+            with chart_cols[2]:
+                st.markdown("#### 路线重合率分布")
+                overlap_chart = (
+                    alt.Chart(chart_df.dropna(subset=["fastest_overlap_pct"]))
+                    .mark_bar(color="#16a34a")
+                    .encode(
+                        x=alt.X("fastest_overlap_pct:Q", bin=alt.Bin(maxbins=10), title="重合率(%)"),
+                        y=alt.Y("count():Q", title="订单数"),
+                        tooltip=[alt.Tooltip("count():Q", title="订单数")],
+                    )
+                )
+                st.altair_chart(overlap_chart, use_container_width=True)
+
         top_cols = [
             col for col in [
                 "order_id",
@@ -965,7 +1069,9 @@ def display_stage08_batch_results(results):
             ]
             if col in success_df.columns
         ]
+        st.markdown("#### 绕行比例最高的3个订单")
         st.dataframe(success_df.sort_values("detour_ratio", ascending=False).head(3)[top_cols], width="stretch", hide_index=True)
+
     display_cols = [
         col for col in [
             "success",
@@ -980,9 +1086,8 @@ def display_stage08_batch_results(results):
         ]
         if col in results.columns
     ]
-    st.markdown("#### 批量结果")
-    st.dataframe(results[display_cols], width="stretch", hide_index=True)
-
+    with st.expander("查看批量明细", expanded=False):
+        st.dataframe(results[display_cols], width="stretch", hide_index=True)
 
 def _format_ratio(value):
     if value is None or pd.isna(value):
@@ -991,65 +1096,44 @@ def _format_ratio(value):
 
 
 def render_map_selection_mode(payload, speed_vehicle_ids):
-    """地图选点模式"""
-    st.info("点击地图依次选择起点和终点")
+    """地图选点模式。控制按钮由左侧控制台触发，主区域只保留地图与结果。"""
+    if st.session_state.get("route_map_reset_requested"):
+        st.session_state["route_map_reset_requested"] = False
+        st.session_state.route_points = []
+        st.session_state.route_result = None
+        if 'map_view_center' in st.session_state:
+            del st.session_state.map_view_center
+        if 'map_view_zoom' in st.session_state:
+            del st.session_state.map_view_zoom
 
-    # 操作按钮
-    col1, col2, col3 = st.columns([1, 1, 2])
-
-    with col1:
-        if st.button("重新选点", width="stretch"):
-            st.session_state.route_points = []
-            st.session_state.route_result = None
-            # 清除地图视图状态，重置为默认视图
-            if 'map_view_center' in st.session_state:
-                del st.session_state.map_view_center
-            if 'map_view_zoom' in st.session_state:
-                del st.session_state.map_view_zoom
-            st.rerun()
-
-    with col2:
+    if st.session_state.get("route_map_calculate_requested"):
+        st.session_state["route_map_calculate_requested"] = False
         can_calculate = len(st.session_state.route_points) == 2
-        if st.button(
-            "计算路线",
-            width="stretch",
-            type="primary" if can_calculate else "secondary",
-            disabled=not can_calculate
-        ):
-            if can_calculate:
-                origin = st.session_state.route_points[0]
-                dest = st.session_state.route_points[1]
-
-                with st.spinner("正在生成全日道路基准速度并计算最短/最快路线..."):
-                    route_result = plan_baseline_routes_between_points(
-                        origin['lat'],
-                        origin['lng'],
-                        dest['lat'],
-                        dest['lng'],
-                        vehicle_ids=tuple(speed_vehicle_ids or []),
-                        query_date=payload["start_time"].date(),
-                    )
-
-                if route_result.get("success"):
-                    st.session_state.route_result = route_result
-                    st.success("路线计算完成。")
-                    st.rerun()
-                else:
-                    st.error(f"路线计算失败: {route_result.get('error', '未知错误')}")
-
-    with col3:
-        points_count = len(st.session_state.route_points)
-        if points_count == 0:
-            st.info("请点击地图选择起点")
-        elif points_count == 1:
-            st.info("已选择起点，请点击地图选择终点")
+        if can_calculate:
+            origin = st.session_state.route_points[0]
+            dest = st.session_state.route_points[1]
+            with st.spinner("正在生成全日道路基准速度并计算最短/最快路线..."):
+                route_result = plan_baseline_routes_between_points(
+                    origin['lat'],
+                    origin['lng'],
+                    dest['lat'],
+                    dest['lng'],
+                    vehicle_ids=tuple(speed_vehicle_ids or []),
+                    query_date=payload["start_time"].date(),
+                )
+            if route_result.get("success"):
+                st.session_state.route_result = route_result
+                st.success("路线计算完成。")
+            else:
+                st.error(f"路线计算失败: {route_result.get('error', '未知错误')}")
         else:
-            st.success("已选择起点和终点，点击「计算路线」按钮")
+            st.warning("请先在地图上选择起点和终点。")
 
     click_payload = render_route_component_map(
         st.session_state.route_points,
         st.session_state.route_result,
         key=f"route_map_{len(st.session_state.route_points)}_{st.session_state.get('route_result') is not None}",
+        boundary_geojson=_load_route_boundary_geojson(),
     )
 
     # 处理地图点击事件

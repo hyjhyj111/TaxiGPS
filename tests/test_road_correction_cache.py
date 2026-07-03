@@ -108,6 +108,117 @@ class RoadCorrectionCacheTest(unittest.TestCase):
         self.assertTrue(os.path.exists(partial["meta"]["cache_path"]))
         self.assertTrue(os.path.exists(partial["meta"]["coverage_path"]))
 
+
+    def test_congestion_segments_fill_selected_scope_with_cached_vehicles(self):
+        samples_by_vehicle = {
+            "cached-a": pd.DataFrame(
+                {
+                    "time": pd.to_datetime(["2023-10-12 08:00:00", "2023-10-12 08:05:00"]),
+                    "vehicle_id": ["cached-a", "cached-a"],
+                    "speed": [20.0, 22.0],
+                    "edge_u": [1, 1],
+                    "edge_v": [2, 2],
+                    "edge_key": [0, 0],
+                    "segment_key": ["1->2", "1->2"],
+                    "edge_identity": ["1->2:0", "1->2:0"],
+                    "edge_length_km": [0.1, 0.1],
+                }
+            ),
+            "cached-b": pd.DataFrame(
+                {
+                    "time": pd.to_datetime(["2023-10-12 08:00:00"]),
+                    "vehicle_id": ["cached-b"],
+                    "speed": [35.0],
+                    "edge_u": [2],
+                    "edge_v": [3],
+                    "edge_key": [0],
+                    "segment_key": ["2->3"],
+                    "edge_identity": ["2->3:0"],
+                    "edge_length_km": [0.2],
+                }
+            ),
+        }
+
+        def fake_existing_slice(vehicle_id, start_time=None, end_time=None, network_meta=None):
+            del start_time, end_time, network_meta
+            return {"rows": samples_by_vehicle.get(str(vehicle_id), pd.DataFrame()), "meta": {"success": str(vehicle_id) in samples_by_vehicle}}
+
+        def fake_cache_rows_to_speed_samples(rows, graph):
+            del graph
+            return rows.copy()
+
+        old_max_vehicles = map_plotter.CONFIG["MAX_CONGESTION_VEHICLES"]
+        old_max_segments = map_plotter.CONFIG["MAX_CONGESTION_SEGMENTS"]
+        map_plotter.CONFIG["MAX_CONGESTION_VEHICLES"] = 10
+        map_plotter.CONFIG["MAX_CONGESTION_SEGMENTS"] = 100
+        self.addCleanup(lambda: map_plotter.CONFIG.__setitem__("MAX_CONGESTION_VEHICLES", old_max_vehicles))
+        self.addCleanup(lambda: map_plotter.CONFIG.__setitem__("MAX_CONGESTION_SEGMENTS", old_max_segments))
+
+        with patch.object(map_plotter, "_load_road_speed_timeslice_cache", return_value=(pd.DataFrame(), {"success": False})), patch.object(
+            map_plotter, "_road_corrected_cache_vehicle_ids", return_value=["cached-a", "cached-b"]
+        ), patch.object(
+            map_plotter, "load_road_network", return_value=(object(), {"path": "/tmp/road.pkl"})
+        ), patch.object(map_plotter, "load_existing_road_corrected_vehicle_slice", side_effect=fake_existing_slice), patch.object(
+            map_plotter, "_cache_rows_to_speed_samples", side_effect=fake_cache_rows_to_speed_samples
+        ), patch.object(map_plotter, "_edge_points_for_display", side_effect=lambda graph, u, v: [[22.0, 114.0], [22.01, 114.01]]):
+            grouped, meta = map_plotter.build_congestion_segments(
+                ["uncached-selected"],
+                start_time="2023-10-12 08:00:00",
+                end_time="2023-10-12 09:00:00",
+                bucket_minutes=15,
+            )
+
+        self.assertTrue(meta["success"])
+        self.assertEqual(meta["explicit_vehicles"], 1)
+        self.assertEqual(meta["cache_fill_vehicles"], 2)
+        self.assertGreaterEqual(meta["vehicles"], 3)
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(set(grouped["edge_identity"]), {"1->2:0", "2->3:0"})
+
+
+    def test_congestion_segments_prefers_timeslice_speed_cache(self):
+        import networkx as nx
+
+        graph = nx.MultiDiGraph()
+        graph.add_node(1, x=114.0, y=22.0)
+        graph.add_node(2, x=114.01, y=22.01)
+        graph.add_edge(1, 2, key=0, length=1000.0)
+
+        cache_path = os.path.join(self.temp_dir, "road_speed_timeslices_15m.csv")
+        pd.DataFrame(
+            {
+                "time_bucket": ["2023-10-12 08:00:00"],
+                "edge_identity": ["1->2:0"],
+                "edge_u": [1],
+                "edge_v": [2],
+                "edge_key": [0],
+                "avg_speed_kmh": [18.0],
+                "sample_count": [5],
+                "vehicle_count": [2],
+                "edge_length_km": [1.0],
+            }
+        ).to_csv(cache_path, index=False)
+
+        old_template = map_plotter.CONFIG.get("ROAD_SPEED_TIMESLICE_CACHE_TEMPLATE")
+        map_plotter.CONFIG["ROAD_SPEED_TIMESLICE_CACHE_TEMPLATE"] = os.path.join(self.temp_dir, "road_speed_timeslices_{bucket}m.csv")
+        self.addCleanup(lambda: map_plotter.CONFIG.__setitem__("ROAD_SPEED_TIMESLICE_CACHE_TEMPLATE", old_template))
+
+        with patch.object(map_plotter, "load_road_network", return_value=(graph, {"path": "/tmp/road.pkl"})), patch.object(
+            map_plotter, "load_existing_road_corrected_vehicle_slice"
+        ) as corrected_mock:
+            grouped, meta = map_plotter.build_congestion_segments(
+                [],
+                start_time="2023-10-12 08:00:00",
+                end_time="2023-10-12 09:00:00",
+                bucket_minutes=15,
+            )
+
+        self.assertTrue(meta["success"])
+        self.assertEqual(meta["source"], "road_speed_timeslice_cache")
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(float(grouped.iloc[0]["speed_kmh"]), 18.0)
+        corrected_mock.assert_not_called()
+
     def test_road_correction_expands_shortest_path_edge_geometry(self):
         import networkx as nx
         from shapely.geometry import LineString

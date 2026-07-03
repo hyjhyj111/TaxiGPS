@@ -65,12 +65,13 @@ CONFIG = {
     "MAX_ROAD_CORRECTION_INPUT_POINTS": 220,
     "MAX_ROAD_CORRECTION_CACHE_POINTS": 1200,
     "MAX_CORRECTED_PATH_POINTS": 1600,
-    "MAX_CONGESTION_VEHICLES": 8,
+    "MAX_CONGESTION_VEHICLES": 50,
     "MAX_CONGESTION_INPUT_POINTS": 90,
-    "MAX_CONGESTION_SEGMENTS": 500,
+    "MAX_CONGESTION_SEGMENTS": 12000,
     "DEFAULT_CONGESTION_BUCKET_MINUTES": 15,
     "DEFAULT_ETA_SPEED_KMH": 28.0,
     "BASELINE_SPEED_CACHE_PATH": "cache/edge_baseline_speed.csv",
+    "ROAD_SPEED_TIMESLICE_CACHE_TEMPLATE": "cache/road_speed_timeslices_{bucket}m.csv",
     "DEFAULT_HIGHWAY_SPEED_KPH": {
         "motorway": 80.0,
         "motorway_link": 40.0,
@@ -1565,6 +1566,274 @@ def _normalize_corrected_cache_rows(rows, vehicle_id=None):
     rows = rows.dropna(subset=["time", "matched_lon", "matched_lat"]).sort_values(["time", "sequence"]).reset_index(drop=True)
     return rows
 
+
+
+def _road_corrected_cache_vehicle_ids():
+    cache_dir = CONFIG["ROAD_CORRECTED_CACHE_DIR"]
+    if not os.path.isdir(cache_dir):
+        return []
+    vehicle_ids = []
+    for filename in os.listdir(cache_dir):
+        lower = filename.lower()
+        if not lower.endswith(".csv") or lower.endswith(".coverage.csv"):
+            continue
+        token = filename.rsplit("_", 1)[0]
+        if token and token not in vehicle_ids:
+            vehicle_ids.append(token)
+    return sorted(vehicle_ids)
+
+
+def _existing_road_corrected_cache_paths(vehicle_id, network_meta=None):
+    cache_dir = CONFIG["ROAD_CORRECTED_CACHE_DIR"]
+    token = _safe_cache_token(vehicle_id)
+    paths = []
+    exact_path = road_corrected_vehicle_cache_path(vehicle_id, network_meta)
+    if os.path.exists(exact_path):
+        paths.append(exact_path)
+    if os.path.isdir(cache_dir):
+        prefix = f"{token}_"
+        for filename in os.listdir(cache_dir):
+            lower = filename.lower()
+            if lower.endswith(".csv") and filename.startswith(prefix):
+                path = os.path.join(cache_dir, filename)
+                if path not in paths:
+                    paths.append(path)
+    return sorted(paths, key=lambda item: os.path.getmtime(item), reverse=True)
+
+
+def load_existing_road_corrected_vehicle_slice(vehicle_id, start_time=None, end_time=None, network_meta=None):
+    """只读取已有路网校正缓存，不触发原始轨迹读取和重新匹配。"""
+    vehicle_id = str(vehicle_id).strip()
+    if not vehicle_id:
+        return {"rows": pd.DataFrame(), "points": [], "meta": {"success": False, "error": "未提供车辆ID。"}}
+    paths = _existing_road_corrected_cache_paths(vehicle_id, network_meta=network_meta)
+    if not paths:
+        return {
+            "rows": pd.DataFrame(),
+            "points": [],
+            "meta": {
+                "success": False,
+                "cache_only": True,
+                "vehicle_id": vehicle_id,
+                "error": f"未找到车辆 {vehicle_id} 的路网校正缓存。",
+            },
+        }
+    errors = []
+    for path in paths:
+        try:
+            rows = _normalize_corrected_cache_rows(pd.read_csv(path), vehicle_id=vehicle_id)
+            rows = slice_road_corrected_rows(rows, start_time=start_time, end_time=end_time)
+            points = _corrected_rows_to_points(rows)
+            meta = {
+                "success": len(rows) > 0,
+                "cache_only": True,
+                "cache_hit": True,
+                "vehicle_id": vehicle_id,
+                "cache_path": path,
+                "cache_rows": int(len(rows)),
+                "window_corrected_points": int(len(points)),
+                "message": "已读取已有路网校正缓存。",
+            }
+            if len(rows) == 0:
+                meta["error"] = "当前时间窗口内没有路网校正缓存记录。"
+            return {"rows": rows, "points": points, "meta": meta}
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+            log.exception("已有路网校正缓存读取失败: %s", path)
+    return {
+        "rows": pd.DataFrame(),
+        "points": [],
+        "meta": {
+            "success": False,
+            "cache_only": True,
+            "vehicle_id": vehicle_id,
+            "error": "路网校正缓存读取失败: " + "; ".join(errors[:3]),
+        },
+    }
+
+
+def _read_edge_baseline_speed_cache():
+    path = CONFIG.get("BASELINE_SPEED_CACHE_PATH", "cache/edge_baseline_speed.csv")
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(), {"success": False, "cache_path": path, "error": "道路速度缓存不存在。"}
+    try:
+        if str(path).lower().endswith(".parquet"):
+            stats = pd.read_parquet(path)
+        else:
+            stats = pd.read_csv(path)
+    except Exception as exc:
+        return pd.DataFrame(), {"success": False, "cache_path": path, "error": f"道路速度缓存读取失败: {exc}"}
+    required = {"edge_u", "edge_v", "edge_key", "avg_speed"}
+    missing = required - set(stats.columns)
+    if missing:
+        return stats, {"success": False, "cache_path": path, "error": f"道路速度缓存缺少字段: {sorted(missing)}"}
+    work = stats.copy()
+    for col in ["edge_u", "edge_v", "edge_key"]:
+        work[col] = work[col].map(_coerce_edge_part)
+    work["avg_speed"] = pd.to_numeric(work.get("avg_speed"), errors="coerce")
+    work["sample_count"] = pd.to_numeric(work.get("sample_count", 0), errors="coerce").fillna(0)
+    valid = work[work["avg_speed"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"], inclusive="both")].copy()
+    reliable = valid[valid["sample_count"] >= 3].copy()
+    source = reliable if len(reliable) else valid
+    global_speed = float(source["avg_speed"].mean()) if len(source) else CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    if pd.isna(global_speed) or global_speed <= 0:
+        global_speed = CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    highway_median = {}
+    if "highway_type" in source.columns and len(source):
+        highway_median = source.groupby("highway_type")["avg_speed"].median().dropna().to_dict()
+    return work, {
+        "success": True,
+        "cache_path": path,
+        "edge_rows": int(len(work)),
+        "observed_edges": int((work["sample_count"] > 0).sum()),
+        "reliable_edges": int(len(reliable)),
+        "global_speed_kmh": float(global_speed),
+        "highway_median_speed": {str(k): float(v) for k, v in highway_median.items()},
+    }
+
+
+def _baseline_speed_lookup_from_cache():
+    stats, meta = _read_edge_baseline_speed_cache()
+    lookup = {}
+    if not meta.get("success") or stats is None or len(stats) == 0:
+        return lookup, meta
+    work = stats.copy()
+    work["avg_speed"] = pd.to_numeric(work.get("avg_speed"), errors="coerce")
+    work["sample_count"] = pd.to_numeric(work.get("sample_count", 0), errors="coerce").fillna(0)
+    valid = work[work["avg_speed"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"], inclusive="both")].copy()
+    for row in valid.itertuples(index=False):
+        speed = float(getattr(row, "avg_speed"))
+        u = _coerce_edge_part(getattr(row, "edge_u"))
+        v = _coerce_edge_part(getattr(row, "edge_v"))
+        key = _coerce_edge_part(getattr(row, "edge_key"))
+        lookup[_segment_key(u, v)] = speed
+        lookup[f"{u}->{v}:{key}"] = speed
+    return lookup, meta
+
+
+def _cache_rows_to_speed_samples(rows, graph):
+    if rows is None or len(rows) == 0:
+        return pd.DataFrame()
+    work = _normalize_corrected_cache_rows(rows)
+    required = ["time", "vehicle_id", "speed", "edge_u", "edge_v", "edge_key"]
+    if any(col not in work.columns for col in required):
+        return pd.DataFrame()
+    work = work.dropna(subset=["time", "edge_u", "edge_v", "edge_key"]).copy()
+    work["speed"] = pd.to_numeric(work["speed"], errors="coerce")
+    work = work[work["speed"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"], inclusive="both")].copy()
+    if len(work) == 0:
+        return pd.DataFrame()
+    for col in ["edge_u", "edge_v", "edge_key"]:
+        work[col] = work[col].map(_coerce_edge_part)
+    work["segment_key"] = work.apply(lambda row: _segment_key(row["edge_u"], row["edge_v"]), axis=1)
+    work["edge_identity"] = work.apply(lambda row: f"{row['edge_u']}->{row['edge_v']}:{row['edge_key']}", axis=1)
+    work["edge_length_km"] = work.apply(lambda row: _edge_length_km(graph, row["edge_u"], row["edge_v"]), axis=1)
+    return work
+
+
+
+def _road_speed_timeslice_cache_path(bucket_minutes):
+    template = CONFIG.get("ROAD_SPEED_TIMESLICE_CACHE_TEMPLATE", "cache/road_speed_timeslices_{bucket}m.csv")
+    return template.format(bucket=int(bucket_minutes or CONFIG["DEFAULT_CONGESTION_BUCKET_MINUTES"]))
+
+
+def _load_road_speed_timeslice_cache(graph, start_time=None, end_time=None, bucket_minutes=15):
+    """读取 HMM 聚合后的道路速度时间片缓存，并转换为拥堵地图统一字段。"""
+    path = _road_speed_timeslice_cache_path(bucket_minutes)
+    if not os.path.exists(path):
+        return pd.DataFrame(), {
+            "success": False,
+            "cache_path": path,
+            "error": "道路速度时间片缓存不存在。",
+        }
+    try:
+        if path.lower().endswith(".parquet"):
+            cached = pd.read_parquet(path)
+        else:
+            cached = pd.read_csv(path)
+    except Exception as exc:
+        return pd.DataFrame(), {
+            "success": False,
+            "cache_path": path,
+            "error": f"道路速度时间片缓存读取失败: {exc}",
+        }
+
+    required = {"time_bucket", "edge_u", "edge_v", "edge_key"}
+    missing = required - set(cached.columns)
+    if missing:
+        return cached, {
+            "success": False,
+            "cache_path": path,
+            "error": f"道路速度时间片缓存缺少字段: {sorted(missing)}",
+        }
+
+    grouped = cached.copy()
+    grouped["time_bucket"] = pd.to_datetime(grouped["time_bucket"], errors="coerce")
+    grouped = grouped.dropna(subset=["time_bucket", "edge_u", "edge_v", "edge_key"])
+    start_dt = safe_datetime(start_time)
+    end_dt = safe_datetime(end_time)
+    if start_dt is not None:
+        grouped = grouped[grouped["time_bucket"] >= pd.Timestamp(start_dt)]
+    if end_dt is not None:
+        grouped = grouped[grouped["time_bucket"] <= pd.Timestamp(end_dt)]
+    if len(grouped) == 0:
+        return grouped, {
+            "success": False,
+            "cache_path": path,
+            "error": "当前时间范围内没有道路速度时间片缓存记录。",
+        }
+
+    if "speed_kmh" not in grouped.columns:
+        grouped["speed_kmh"] = pd.to_numeric(grouped.get("avg_speed_kmh"), errors="coerce")
+    else:
+        grouped["speed_kmh"] = pd.to_numeric(grouped["speed_kmh"], errors="coerce")
+    grouped = grouped[grouped["speed_kmh"].between(1, CONFIG["ANIMATION_SPEED_CAP_KMH"], inclusive="both")].copy()
+    if len(grouped) == 0:
+        return grouped, {
+            "success": False,
+            "cache_path": path,
+            "error": "道路速度时间片缓存记录均未通过速度质量过滤。",
+        }
+
+    for col in ["edge_u", "edge_v", "edge_key"]:
+        grouped[col] = grouped[col].map(_coerce_edge_part)
+    grouped["segment_key"] = grouped.apply(lambda row: _segment_key(row["edge_u"], row["edge_v"]), axis=1)
+    grouped["edge_identity"] = grouped.apply(lambda row: f"{row['edge_u']}->{row['edge_v']}:{row['edge_key']}", axis=1)
+    grouped["sample_count"] = pd.to_numeric(grouped.get("sample_count", 1), errors="coerce").fillna(1).astype(int)
+    grouped["vehicle_count"] = pd.to_numeric(grouped.get("vehicle_count", 1), errors="coerce").fillna(1).astype(int)
+    if "edge_length_km" not in grouped.columns:
+        grouped["edge_length_km"] = grouped.apply(lambda row: _edge_length_km(graph, row["edge_u"], row["edge_v"]), axis=1)
+    else:
+        grouped["edge_length_km"] = pd.to_numeric(grouped["edge_length_km"], errors="coerce")
+    grouped["color"] = grouped["speed_kmh"].apply(speed_to_color)
+    grouped["level"] = grouped["speed_kmh"].apply(speed_to_level)
+    grouped["geometry_points"] = grouped.apply(lambda row: _edge_points_for_display(graph, row["edge_u"], row["edge_v"]), axis=1)
+    grouped["lat1"] = grouped["geometry_points"].apply(lambda points: float(points[0][0]) if isinstance(points, list) and len(points) else np.nan)
+    grouped["lng1"] = grouped["geometry_points"].apply(lambda points: float(points[0][1]) if isinstance(points, list) and len(points) else np.nan)
+    grouped["lat2"] = grouped["geometry_points"].apply(lambda points: float(points[-1][0]) if isinstance(points, list) and len(points) else np.nan)
+    grouped["lng2"] = grouped["geometry_points"].apply(lambda points: float(points[-1][1]) if isinstance(points, list) and len(points) else np.nan)
+    grouped = grouped.dropna(subset=["lat1", "lng1", "lat2", "lng2"]).sort_values(
+        ["time_bucket", "sample_count", "edge_length_km"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    return grouped, {
+        "success": len(grouped) > 0,
+        "cache_path": path,
+        "source": "road_speed_timeslice_cache",
+        "segment_rows": int(len(grouped)),
+        "time_slices": int(grouped["time_bucket"].nunique()) if len(grouped) else 0,
+        "bucket_minutes": int(bucket_minutes or CONFIG["DEFAULT_CONGESTION_BUCKET_MINUTES"]),
+    }
+
+
+def _edge_points_for_display(graph, source, target):
+    points = _edge_geometry_points(graph, source, target, weight="length")
+    if len(points) >= 2:
+        return points
+    start = _node_lat_lng(graph, source)
+    end = _node_lat_lng(graph, target)
+    return [point for point in [start, end] if point]
 
 def speed_to_color(speed_kmh):
     if speed_kmh is None or pd.isna(speed_kmh):
@@ -3827,49 +4096,95 @@ def plot_road_corrected_trajectories(vehicle_ids, start_time=None, end_time=None
 
 
 def build_congestion_segments(vehicle_ids, start_time=None, end_time=None, bucket_minutes=15):
-    cleaned_vehicle_ids = []
+    explicit_vehicle_ids = []
     for vehicle_id in vehicle_ids or []:
-        vehicle_id = str(vehicle_id).strip()
-        if vehicle_id and vehicle_id not in cleaned_vehicle_ids:
-            cleaned_vehicle_ids.append(vehicle_id)
-    cleaned_vehicle_ids = cleaned_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
+        vehicle_id = str(vehicle_id).strip().replace(".0", "")
+        if vehicle_id and vehicle_id not in explicit_vehicle_ids:
+            explicit_vehicle_ids.append(vehicle_id)
+
+    cached_vehicle_ids = _road_corrected_cache_vehicle_ids()
+    requested_vehicle_ids = list(explicit_vehicle_ids)
+    for cached_vehicle_id in cached_vehicle_ids:
+        if cached_vehicle_id not in requested_vehicle_ids:
+            requested_vehicle_ids.append(cached_vehicle_id)
+    if not requested_vehicle_ids:
+        requested_vehicle_ids = cached_vehicle_ids
+    cleaned_vehicle_ids = requested_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
 
     graph, network_meta = load_road_network()
     if graph is None:
         return pd.DataFrame(), {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
 
+    timeslice_grouped, timeslice_meta = _load_road_speed_timeslice_cache(
+        graph,
+        start_time=start_time,
+        end_time=end_time,
+        bucket_minutes=bucket_minutes,
+    )
+    if timeslice_meta.get("success") and len(timeslice_grouped) > 0:
+        if len(timeslice_grouped) > CONFIG["MAX_CONGESTION_SEGMENTS"]:
+            timeslice_grouped = (
+                timeslice_grouped.sort_values(["time_bucket", "sample_count", "edge_length_km"], ascending=[True, False, False])
+                .groupby("time_bucket", group_keys=False)
+                .head(max(20, CONFIG["MAX_CONGESTION_SEGMENTS"] // max(1, timeslice_grouped["time_bucket"].nunique())))
+                .head(CONFIG["MAX_CONGESTION_SEGMENTS"])
+                .reset_index(drop=True)
+            )
+        timeslice_meta.update(
+            {
+                "success": True,
+                "cache_only": True,
+                "method": "优先读取 HMM 道路速度时间片缓存，按道路边与时间片展示拥堵状态；未读取原始GPS大表。",
+                "vehicles": len(cleaned_vehicle_ids),
+                "requested_vehicles": len(requested_vehicle_ids),
+                "explicit_vehicles": len(explicit_vehicle_ids),
+                "cache_fill_vehicles": max(0, len(cleaned_vehicle_ids) - len([item for item in explicit_vehicle_ids if item in cleaned_vehicle_ids])),
+                "segment_rows": len(timeslice_grouped),
+                "time_slices": int(timeslice_grouped["time_bucket"].nunique()) if len(timeslice_grouped) else 0,
+                "network": network_meta,
+                "fallback_cache_probe": timeslice_meta.get("cache_path", ""),
+            }
+        )
+        return timeslice_grouped, timeslice_meta
+
+    if not cleaned_vehicle_ids:
+        return pd.DataFrame(), {
+            "success": False,
+            "cache_only": True,
+            "error": f"未找到路网校正缓存: {CONFIG['ROAD_CORRECTED_CACHE_DIR']}。拥堵与ETA不会读取原始GPS大表。",
+            "network": network_meta,
+        }
+
     matched_frames = []
     matching_rows = []
     for vehicle_id in cleaned_vehicle_ids:
-        df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
-        if df is None or len(df) < 2:
-            matching_rows.append({"vehicle_id": vehicle_id, "success": False, "message": "当前时间范围内轨迹点不足。"})
-            continue
-        df = df.copy()
-        df["vehicle_id"] = vehicle_id
-        result = approximate_hmm_match_trajectory(df, graph=graph, network_meta=network_meta)
-        meta = result["meta"]
+        result = load_existing_road_corrected_vehicle_slice(
+            vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
+            network_meta=network_meta,
+        )
+        meta = result.get("meta", {})
+        rows = result.get("rows", pd.DataFrame())
+        speed_samples = _cache_rows_to_speed_samples(rows, graph)
         matching_rows.append(
             {
                 "vehicle_id": vehicle_id,
-                "success": bool(meta.get("success")),
-                "raw_points": meta.get("raw_points", len(df)),
-                "sampled_points": meta.get("sampled_points", 0),
-                "matched_nodes": meta.get("matched_nodes", 0),
-                "segments": meta.get("segments", 0),
-                "path_failures": meta.get("path_failures", 0),
-                "nearest_failures": meta.get("nearest_failures", 0),
-                "message": meta.get("error", "匹配完成。"),
+                "success": bool(len(speed_samples) > 0),
+                "cache_rows": int(len(rows)) if rows is not None else 0,
+                "speed_samples": int(len(speed_samples)),
+                "cache_path": meta.get("cache_path", ""),
+                "message": meta.get("message") or meta.get("error", "已读取缓存。"),
             }
         )
-        segments = result["segments"]
-        if segments is not None and len(segments) > 0:
-            matched_frames.append(segments)
+        if len(speed_samples) > 0:
+            matched_frames.append(speed_samples)
 
     if not matched_frames:
         return pd.DataFrame(), {
             "success": False,
-            "error": "没有生成可聚合的路段速度。",
+            "cache_only": True,
+            "error": "当前车辆和时间范围内没有可聚合的路网校正速度缓存。",
             "network": network_meta,
             "matching": matching_rows,
         }
@@ -3878,22 +4193,25 @@ def build_congestion_segments(vehicle_ids, start_time=None, end_time=None, bucke
     bucket_minutes = int(bucket_minutes or 15)
     matched_df["time_bucket"] = pd.to_datetime(matched_df["time"]).dt.floor(f"{bucket_minutes}min")
     grouped = (
-        matched_df.groupby(["time_bucket", "segment_key"], as_index=False)
+        matched_df.groupby(["time_bucket", "segment_key", "edge_identity", "edge_u", "edge_v", "edge_key"], as_index=False)
         .agg(
-            speed_kmh=("speed_kmh", "mean"),
+            speed_kmh=("speed", "mean"),
             vehicle_count=("vehicle_id", "nunique"),
-            sample_count=("speed_kmh", "size"),
+            sample_count=("speed", "size"),
             edge_length_km=("edge_length_km", "mean"),
-            lat1=("lat1", "first"),
-            lng1=("lng1", "first"),
-            lat2=("lat2", "first"),
-            lng2=("lng2", "first"),
         )
         .sort_values(["time_bucket", "sample_count"], ascending=[True, False])
         .reset_index(drop=True)
     )
     grouped["color"] = grouped["speed_kmh"].apply(speed_to_color)
     grouped["level"] = grouped["speed_kmh"].apply(speed_to_level)
+    grouped["geometry_points"] = grouped.apply(lambda row: _edge_points_for_display(graph, row["edge_u"], row["edge_v"]), axis=1)
+    grouped["lat1"] = grouped["geometry_points"].apply(lambda points: float(points[0][0]) if len(points) else np.nan)
+    grouped["lng1"] = grouped["geometry_points"].apply(lambda points: float(points[0][1]) if len(points) else np.nan)
+    grouped["lat2"] = grouped["geometry_points"].apply(lambda points: float(points[-1][0]) if len(points) else np.nan)
+    grouped["lng2"] = grouped["geometry_points"].apply(lambda points: float(points[-1][1]) if len(points) else np.nan)
+    grouped = grouped.dropna(subset=["lat1", "lng1", "lat2", "lng2"]).reset_index(drop=True)
+
     if len(grouped) > CONFIG["MAX_CONGESTION_SEGMENTS"]:
         grouped = (
             grouped.sort_values(["time_bucket", "sample_count", "edge_length_km"], ascending=[True, False, False])
@@ -3905,16 +4223,19 @@ def build_congestion_segments(vehicle_ids, start_time=None, end_time=None, bucke
 
     meta = {
         "success": True,
-        "method": "近似 HMM: 最近道路节点作为发射近似，最短路连续性作为转移约束。",
+        "cache_only": True,
+        "method": "只读取已有路网校正缓存，按道路边与时间片聚合速度；未执行原始GPS扫描或重新匹配。",
         "vehicles": len(cleaned_vehicle_ids),
+        "requested_vehicles": len(requested_vehicle_ids),
+        "explicit_vehicles": len(explicit_vehicle_ids),
+        "cache_fill_vehicles": max(0, len(cleaned_vehicle_ids) - len([item for item in explicit_vehicle_ids if item in cleaned_vehicle_ids])),
         "bucket_minutes": bucket_minutes,
         "segment_rows": len(grouped),
-        "time_slices": int(grouped["time_bucket"].nunique()),
+        "time_slices": int(grouped["time_bucket"].nunique()) if len(grouped) else 0,
         "network": network_meta,
         "matching": matching_rows,
     }
     return grouped, meta
-
 
 def _congestion_legend_html(title, subtitle, network_label=None):
     network_line = f'<div style="font-size:11px;color:#64748b;line-height:1.45;border-top:1px solid rgba(148,163,184,0.25);padding-top:8px;">路网: {network_label}</div>' if network_label else ""
@@ -3940,7 +4261,10 @@ def _inject_congestion_player(m, grouped):
             {
                 "bucket": pd.Timestamp(row["time_bucket"]).strftime("%H:%M"),
                 "segmentKey": row["segment_key"],
-                "points": [[float(row["lat1"]), float(row["lng1"])], [float(row["lat2"]), float(row["lng2"])]],
+                "points": [
+                    [float(point[0]), float(point[1])]
+                    for point in (row.get("geometry_points") if isinstance(row.get("geometry_points"), list) else [])
+                ] or [[float(row["lat1"]), float(row["lng1"])], [float(row["lat2"]), float(row["lng2"])]],
                 "speed": round(float(row["speed_kmh"]), 1),
                 "color": row["color"],
                 "level": row["level"],
@@ -3949,13 +4273,15 @@ def _inject_congestion_player(m, grouped):
             }
         )
     player_html = f"""
-    <div id="{panel_id}" style="position:fixed;left:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:260px;">
+    <div id="{panel_id}" style="position:fixed;left:16px;top:16px;z-index:9999;background:rgba(255,255,255,0.96);border:1px solid rgba(148,163,184,0.45);border-radius:12px;padding:10px 12px;box-shadow:0 12px 30px rgba(15,23,42,0.14);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#0f172a;min-width:270px;">
       <div style="font-size:12px;font-weight:800;margin-bottom:6px;">路段速度播放</div>
       <div data-role="bucket" style="font-size:12px;color:#475569;margin-bottom:8px;">准备中</div>
       <div style="display:flex;align-items:center;gap:8px;">
+        <button data-role="prev" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;">上一个</button>
         <button data-role="play" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:4px 10px;cursor:pointer;">播放</button>
-        <input data-role="slider" type="range" min="0" max="0" value="0" style="width:150px;accent-color:#2563eb;">
+        <button data-role="next" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;">下一个</button>
       </div>
+      <input data-role="slider" type="range" min="0" max="0" value="0" style="width:100%;margin-top:8px;accent-color:#2563eb;">
     </div>
     """
     player_js = f"""
@@ -3968,32 +4294,66 @@ def _inject_congestion_player(m, grouped):
         }}
         var rows = {json.dumps(rows, ensure_ascii=False)};
         var buckets = Array.from(new Set(rows.map(function(row) {{ return row.bucket; }})));
+        var grouped = {{}};
+        rows.forEach(function(row) {{
+            if (!grouped[row.bucket]) grouped[row.bucket] = [];
+            grouped[row.bucket].push(row);
+        }});
         var layerGroup = L.layerGroup().addTo(map);
         var slider = panel.querySelector('[data-role="slider"]');
         var playButton = panel.querySelector('[data-role="play"]');
+        var prevButton = panel.querySelector('[data-role="prev"]');
+        var nextButton = panel.querySelector('[data-role="next"]');
         var label = panel.querySelector('[data-role="bucket"]');
         var timer = null;
+        var renderToken = 0;
         slider.max = Math.max(0, buckets.length - 1);
-        function render(index) {{
-            layerGroup.clearLayers();
-            var bucket = buckets[index] || '';
-            var bucketRows = rows.filter(function(row) {{ return row.bucket === bucket; }});
-            bucketRows.forEach(function(row) {{
-                L.polyline(row.points, {{
+
+        function drawChunk(bucketRows, offset, token) {{
+            if (token !== renderToken) return;
+            var end = Math.min(bucketRows.length, offset + 80);
+            for (var i = offset; i < end; i += 1) {{
+                var row = bucketRows[i];
+                var line = L.polyline(row.points, {{
                     color: row.color,
                     weight: 6,
-                    opacity: 0.86,
-                    lineCap: 'round'
+                    opacity: 0.05,
+                    lineCap: 'round',
+                    lineJoin: 'round',
+                    smoothFactor: 1.2
                 }}).bindTooltip(
                     row.segmentKey + '<br>' + row.level + ' ' + row.speed + ' km/h<br>样本 ' + row.samples + ' / 车辆 ' + row.vehicles
                 ).addTo(layerGroup);
-            }});
+                if (line._path) {{
+                    line._path.style.transition = 'opacity 260ms ease, stroke-width 260ms ease';
+                }}
+                (function(polyline) {{
+                    window.setTimeout(function() {{ polyline.setStyle({{ opacity: 0.86 }}); }}, 20);
+                }})(line);
+            }}
+            if (end < bucketRows.length) {{
+                window.requestAnimationFrame(function() {{ drawChunk(bucketRows, end, token); }});
+            }}
+        }}
+
+        function render(index) {{
+            renderToken += 1;
+            layerGroup.clearLayers();
+            var bucket = buckets[index] || '';
+            var bucketRows = grouped[bucket] || [];
             label.textContent = bucket ? ('时间片 ' + bucket + '，路段 ' + bucketRows.length + ' 条') : '无可播放路段';
             slider.value = index;
+            window.requestAnimationFrame(function() {{ drawChunk(bucketRows, 0, renderToken); }});
         }}
-        slider.addEventListener('input', function() {{
-            render(Number(slider.value || 0));
-        }});
+
+        function step(delta) {{
+            if (!buckets.length) return;
+            var next = (Number(slider.value || 0) + delta + buckets.length) % buckets.length;
+            render(next);
+        }}
+        slider.addEventListener('input', function() {{ render(Number(slider.value || 0)); }});
+        prevButton.addEventListener('click', function() {{ step(-1); }});
+        nextButton.addEventListener('click', function() {{ step(1); }});
         playButton.addEventListener('click', function() {{
             if (timer) {{
                 window.clearInterval(timer);
@@ -4002,17 +4362,13 @@ def _inject_congestion_player(m, grouped):
                 return;
             }}
             playButton.textContent = '暂停';
-            timer = window.setInterval(function() {{
-                var next = (Number(slider.value || 0) + 1) % Math.max(1, buckets.length);
-                render(next);
-            }}, 900);
+            timer = window.setInterval(function() {{ step(1); }}, 700);
         }});
         render(0);
     }})();
     """
     m.get_root().html.add_child(folium.Element(player_html))
     m.get_root().script.add_child(folium.Element(player_js))
-
 
 def plot_congestion_roads(vehicle_ids, start_time=None, end_time=None, bucket_minutes=15, save_path=None):
     grouped, meta = build_congestion_segments(vehicle_ids, start_time, end_time, bucket_minutes=bucket_minutes)
@@ -4062,7 +4418,10 @@ def _historical_speed_lookup(grouped):
     lookup = {}
     for _, row in grouped.iterrows():
         speed = float(row["speed_kmh"]) if pd.notna(row["speed_kmh"]) else global_speed
-        lookup[row["segment_key"]] = max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], speed))
+        safe_speed = max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], speed))
+        lookup[row["segment_key"]] = safe_speed
+        if "edge_identity" in grouped.columns and pd.notna(row.get("edge_identity")):
+            lookup[row["edge_identity"]] = safe_speed
     return lookup, global_speed
 
 
@@ -4078,58 +4437,609 @@ def estimate_eta(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids=None, s
         log.exception("ETA 起终点最近节点匹配失败")
         return {"success": False, "error": f"起终点最近道路节点匹配失败: {exc}", "network": network_meta}
 
+    baseline_lookup, baseline_meta = _baseline_speed_lookup_from_cache()
+    baseline_stats, baseline_stats_meta = _read_edge_baseline_speed_cache()
+    if baseline_stats_meta.get("success"):
+        apply_baseline_route_cost(
+            graph,
+            baseline_stats,
+            highway_median_speed=baseline_stats_meta.get("highway_median_speed", {}),
+            default_speed_kph=CONFIG["DEFAULT_HIGHWAY_SPEED_KPH"],
+            min_samples=3,
+        )
+
     undirected_graph = None
     if hasattr(graph, "is_directed") and graph.is_directed():
         try:
             undirected_graph = graph.to_undirected(as_view=True)
         except TypeError:
             undirected_graph = graph.to_undirected()
-    try:
-        path_nodes, path_mode = _shortest_path_nodes(graph, origin_node, dest_node, undirected_graph=undirected_graph)
-    except Exception as exc:
-        log.exception("ETA 最短路径失败")
-        return {"success": False, "error": f"起终点之间没有可用路网路径: {exc}", "network": network_meta}
 
     grouped, speed_meta = build_congestion_segments(vehicle_ids or [], start_time, end_time, bucket_minutes=bucket_minutes)
-    speed_lookup, global_speed = _historical_speed_lookup(grouped)
-    route_points = []
-    route_segments = []
-    eta_hours = 0.0
-    total_distance_km = 0.0
-    for idx, node in enumerate(path_nodes):
-        point = _node_lat_lng(graph, node)
-        if point:
-            route_points.append(point)
-        if idx == 0:
-            continue
-        source = path_nodes[idx - 1]
-        target = node
-        length_km = _edge_length_km(graph, source, target)
-        if pd.isna(length_km) or length_km <= 0:
-            prev_point = _node_lat_lng(graph, source)
-            cur_point = _node_lat_lng(graph, target)
-            length_km = haversine_distance(prev_point[0], prev_point[1], cur_point[0], cur_point[1]) if prev_point and cur_point else 0.0
-        speed = speed_lookup.get(_segment_key(source, target), global_speed)
-        total_distance_km += float(length_km)
-        eta_hours += float(length_km) / max(5.0, float(speed))
-        route_segments.append({"segment_key": _segment_key(source, target), "length_km": float(length_km), "speed_kmh": float(speed)})
+    time_speed_lookup, time_global_speed = _historical_speed_lookup(grouped)
+    fallback_global_speed = float(time_global_speed or baseline_meta.get("global_speed_kmh") or CONFIG["DEFAULT_ETA_SPEED_KMH"])
+    if pd.isna(fallback_global_speed) or fallback_global_speed <= 0:
+        fallback_global_speed = CONFIG["DEFAULT_ETA_SPEED_KMH"]
 
+    def edge_speed(source, target, edge_key):
+        edge_identity = f"{source}->{target}:{edge_key}"
+        reverse_identity = f"{target}->{source}:{edge_key}"
+        candidates = [
+            (time_speed_lookup.get(edge_identity), "查询时段路网校正速度"),
+            (time_speed_lookup.get(_segment_key(source, target)), "查询时段路网校正速度"),
+            (time_speed_lookup.get(reverse_identity), "查询时段反向补桥速度"),
+            (time_speed_lookup.get(_segment_key(target, source)), "查询时段反向补桥速度"),
+            (baseline_lookup.get(edge_identity), "全日道路速度缓存"),
+            (baseline_lookup.get(_segment_key(source, target)), "全日道路速度缓存"),
+            (baseline_lookup.get(reverse_identity), "全日反向道路速度缓存"),
+            (baseline_lookup.get(_segment_key(target, source)), "全日反向道路速度缓存"),
+        ]
+        for speed, source_label in candidates:
+            if speed is not None and pd.notna(speed) and float(speed) > 0:
+                return max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], float(speed))), source_label
+        key, data = _best_edge_data(graph, source, target, weight="length")
+        if not data:
+            key, data = _best_edge_data(graph, target, source, weight="length")
+        if data:
+            graph_speed = data.get("baseline_speed_kph")
+            if graph_speed is not None and pd.notna(graph_speed) and float(graph_speed) > 0:
+                return max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], float(graph_speed))), "路网默认速度"
+        return max(5.0, min(CONFIG["ANIMATION_SPEED_CAP_KMH"], fallback_global_speed)), "全局回退速度"
+
+    def summarize_path(path_nodes, label, weight):
+        route_points = []
+        route_segments = []
+        eta_hours = 0.0
+        total_distance_km = 0.0
+        speed_sources = {}
+        missing_speed_edges = 0
+        for idx, node in enumerate(path_nodes or []):
+            if idx == 0:
+                point = _node_lat_lng(graph, node)
+                if point:
+                    route_points.append(point)
+                continue
+            source = path_nodes[idx - 1]
+            target = node
+            edge_key, edge_data = _best_edge_data(graph, source, target, weight="length")
+            if edge_data is None:
+                edge_key, edge_data = _best_edge_data(graph, target, source, weight="length")
+            edge_key = 0 if edge_key is None else edge_key
+            length_km = _edge_length_km(graph, source, target)
+            if pd.isna(length_km) or length_km <= 0:
+                prev_point = _node_lat_lng(graph, source)
+                cur_point = _node_lat_lng(graph, target)
+                length_km = haversine_distance(prev_point[0], prev_point[1], cur_point[0], cur_point[1]) if prev_point and cur_point else 0.0
+            speed, speed_source = edge_speed(source, target, edge_key)
+            if "回退" in speed_source or "默认" in speed_source:
+                missing_speed_edges += 1
+            speed_sources[speed_source] = speed_sources.get(speed_source, 0) + 1
+            total_distance_km += float(length_km)
+            eta_hours += float(length_km) / max(5.0, float(speed))
+            edge_points = _edge_points_for_display(graph, source, target)
+            for point in edge_points:
+                if route_points and route_points[-1] == point:
+                    continue
+                route_points.append(point)
+            route_segments.append(
+                {
+                    "segment_key": _segment_key(source, target),
+                    "edge_identity": f"{source}->{target}:{edge_key}",
+                    "length_km": float(length_km),
+                    "speed_kmh": float(speed),
+                    "speed_source": speed_source,
+                    "eta_minutes": float(length_km) / max(5.0, float(speed)) * 60.0,
+                }
+            )
+        return {
+            "label": label,
+            "weight": weight,
+            "nodes": list(path_nodes or []),
+            "route_points": route_points,
+            "route_segments": route_segments,
+            "distance_km": float(total_distance_km),
+            "eta_minutes": float(eta_hours * 60.0),
+            "avg_speed_kmh": float(total_distance_km / eta_hours) if eta_hours > 0 else fallback_global_speed,
+            "edge_count": int(max(0, len(path_nodes or []) - 1)),
+            "missing_speed_edges": int(missing_speed_edges),
+            "speed_sources": speed_sources,
+        }
+
+    alternatives = []
+    path_errors = []
+    for label, weight in [("距离最短", "length"), ("基准最快", "route_cost")]:
+        try:
+            path_nodes, path_mode = _shortest_path_nodes(graph, origin_node, dest_node, undirected_graph=undirected_graph, weight=weight)
+            summary = summarize_path(path_nodes, label, weight)
+            summary["path_mode"] = path_mode
+            alternatives.append(summary)
+        except Exception as exc:
+            path_errors.append(f"{label}: {exc}")
+
+    if not alternatives:
+        return {"success": False, "error": "起终点之间没有可用路网路径: " + "; ".join(path_errors), "network": network_meta}
+
+    primary = alternatives[0]
+    slow_segments = sorted(primary["route_segments"], key=lambda item: item["speed_kmh"])[:8]
     return {
-        "success": len(route_points) >= 2,
+        "success": len(primary["route_points"]) >= 2,
         "origin_node": origin_node,
         "dest_node": dest_node,
-        "path_mode": path_mode,
-        "distance_km": total_distance_km,
-        "eta_minutes": eta_hours * 60.0,
-        "avg_speed_kmh": total_distance_km / eta_hours if eta_hours > 0 else global_speed,
-        "route_points": route_points,
-        "route_segments": route_segments,
-        "historical_speed_kmh": global_speed,
-        "method": "路网最短路径距离 + 当前查询时段匹配路段历史平均速度；缺失路段使用查询样本全局均速。",
+        "path_mode": primary.get("path_mode"),
+        "distance_km": primary["distance_km"],
+        "eta_minutes": primary["eta_minutes"],
+        "avg_speed_kmh": primary["avg_speed_kmh"],
+        "route_points": primary["route_points"],
+        "route_segments": primary["route_segments"],
+        "historical_speed_kmh": fallback_global_speed,
+        "method": "路网路径 + 路网校正缓存时间片速度；缺失路段依次回退到全日道路速度缓存、路网默认速度、全局速度。",
         "network": network_meta,
         "speed_meta": speed_meta,
+        "baseline_speed_meta": baseline_meta,
+        "alternatives": alternatives,
+        "slow_segments": slow_segments,
+        "missing_speed_edges": primary["missing_speed_edges"],
+        "speed_sources": primary["speed_sources"],
+        "path_errors": path_errors,
     }
 
+
+def run_hmm_speed_aggregation(vehicle_ids, start_time=None, end_time=None, bucket_minutes=15, min_samples=3, force_rebuild=False, save_speed_path=None, save_timeslice_path=None):
+    """执行车辆缓存级 HMM/近似 HMM 路网校正，并聚合道路速度缓存。"""
+    cleaned_vehicle_ids = []
+    for vehicle_id in vehicle_ids or []:
+        token = str(vehicle_id).strip().replace(".0", "")
+        if token and token not in cleaned_vehicle_ids:
+            cleaned_vehicle_ids.append(token)
+    if not cleaned_vehicle_ids:
+        return {"success": False, "error": "请选择至少一辆车辆用于 HMM 与道路速度聚合。"}
+
+    graph, network_meta = load_road_network()
+    if graph is None:
+        return {"success": False, "error": network_meta.get("error", "路网未加载。"), "network": network_meta}
+
+    corrected_frames = []
+    vehicle_rows = []
+    for vehicle_id in cleaned_vehicle_ids:
+        result = load_road_corrected_vehicle_slice(
+            vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
+            graph=graph,
+            network_meta=network_meta,
+            force_rebuild=force_rebuild,
+        )
+        meta = result.get("meta", {})
+        rows = _normalize_corrected_cache_rows(result.get("rows"), vehicle_id=vehicle_id)
+        vehicle_rows.append(
+            {
+                "vehicle_id": vehicle_id,
+                "success": bool(meta.get("success")),
+                "cache_rows": int(len(rows)),
+                "corrected_points": int(meta.get("window_corrected_points", meta.get("corrected_points", 0)) or 0),
+                "processed_intervals": int(meta.get("processed_intervals", 0) or 0),
+                "cache_hit": bool(meta.get("cache_hit", False)),
+                "cache_path": meta.get("cache_path", ""),
+                "message": meta.get("message") or meta.get("error", ""),
+            }
+        )
+        if len(rows) > 0:
+            corrected_frames.append(rows)
+
+    if corrected_frames:
+        corrected = pd.concat(corrected_frames, ignore_index=True)
+    else:
+        corrected = pd.DataFrame(columns=["vehicle_id", "time", "speed", "edge_u", "edge_v", "edge_key"])
+
+    matched_track = corrected.rename(columns={"vehicle_id": "id"}).copy()
+    for col in ["id", "speed", "edge_u", "edge_v", "edge_key"]:
+        if col not in matched_track.columns:
+            matched_track[col] = np.nan
+    save_speed_path = save_speed_path or CONFIG.get("BASELINE_SPEED_CACHE_PATH", "cache/edge_baseline_speed.csv")
+    speed_stats, speed_meta = build_edge_baseline_speed_cache(
+        matched_track[["id", "speed", "edge_u", "edge_v", "edge_key"]],
+        graph,
+        min_samples=min_samples,
+        save_path=save_speed_path,
+    )
+    cost_meta = apply_baseline_route_cost(
+        graph,
+        speed_stats,
+        highway_median_speed=speed_meta.get("highway_median_speed", {}),
+        default_speed_kph=CONFIG["DEFAULT_HIGHWAY_SPEED_KPH"],
+        min_samples=min_samples,
+    )
+
+    speed_samples = _cache_rows_to_speed_samples(corrected, graph)
+    time_slice_stats = pd.DataFrame()
+    if len(speed_samples) > 0:
+        bucket_minutes = max(1, int(bucket_minutes or CONFIG["DEFAULT_CONGESTION_BUCKET_MINUTES"]))
+        work = speed_samples.copy()
+        work["time_bucket"] = pd.to_datetime(work["time"]).dt.floor(f"{bucket_minutes}min")
+        time_slice_stats = (
+            work.groupby(["time_bucket", "edge_identity", "edge_u", "edge_v", "edge_key"], as_index=False)
+            .agg(
+                avg_speed_kmh=("speed", "mean"),
+                sample_count=("speed", "size"),
+                vehicle_count=("vehicle_id", "nunique"),
+                edge_length_km=("edge_length_km", "mean"),
+            )
+            .sort_values(["time_bucket", "sample_count"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+    if save_timeslice_path is None:
+        save_timeslice_path = os.path.join("cache", f"road_speed_timeslices_{int(bucket_minutes)}m.csv")
+    if len(time_slice_stats) > 0:
+        ensure_parent_dir(save_timeslice_path)
+        time_slice_stats.to_csv(save_timeslice_path, index=False)
+
+    return {
+        "success": True,
+        "method": "车辆缓存 -> 近似HMM路网校正 -> 道路边速度聚合 -> route_cost注入。",
+        "vehicles": int(len(cleaned_vehicle_ids)),
+        "corrected_rows": int(len(corrected)),
+        "speed_edge_rows": int(speed_meta.get("edge_rows", 0)),
+        "observed_edges": int(speed_meta.get("observed_edges", 0)),
+        "reliable_edges": int(speed_meta.get("reliable_edges", 0)),
+        "time_slice_rows": int(len(time_slice_stats)),
+        "time_slices": int(time_slice_stats["time_bucket"].nunique()) if len(time_slice_stats) else 0,
+        "bucket_minutes": int(bucket_minutes),
+        "speed_cache_path": save_speed_path,
+        "timeslice_cache_path": save_timeslice_path if len(time_slice_stats) else "",
+        "vehicles_detail": vehicle_rows,
+        "speed_meta": speed_meta,
+        "cost_meta": cost_meta,
+        "network": network_meta,
+    }
+
+
+def _read_eta_od_cache():
+    candidates = [
+        "cache/od_endpoints_completed.parquet",
+        "cache/od_corrected.parquet",
+        "cache/od_endpoints_completed.csv",
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            if path.lower().endswith(".parquet"):
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(path)
+            return df, {"success": True, "cache_path": path}
+        except Exception as exc:
+            return pd.DataFrame(), {"success": False, "cache_path": path, "error": str(exc)}
+    return pd.DataFrame(), {"success": False, "error": "未找到 OD 订单缓存。"}
+
+
+def _first_existing(columns, aliases):
+    for alias in aliases:
+        if alias in columns:
+            return alias
+    return None
+
+
+def _normalize_eta_orders(od_df):
+    if od_df is None or len(od_df) == 0:
+        return pd.DataFrame()
+    cols = set(od_df.columns)
+    mapping = {
+        "vehicle_id": _first_existing(cols, ["vehicle_id", "id", "O_TAXI_ID"]),
+        "pickup_time": _first_existing(cols, ["pickup_time", "O_time"]),
+        "dropoff_time": _first_existing(cols, ["dropoff_time", "D_time"]),
+        "pickup_lat": _first_existing(cols, ["pickup_matched_lat", "O_corrected_lat", "O_lat"]),
+        "pickup_lng": _first_existing(cols, ["pickup_matched_lon", "pickup_matched_lng", "O_corrected_lng", "O_lng"]),
+        "dropoff_lat": _first_existing(cols, ["dropoff_matched_lat", "D_corrected_lat", "D_lat"]),
+        "dropoff_lng": _first_existing(cols, ["dropoff_matched_lon", "dropoff_matched_lng", "D_corrected_lng", "D_lng"]),
+        "pickup_node": _first_existing(cols, ["pickup_node", "O_matched_node"]),
+        "dropoff_node": _first_existing(cols, ["dropoff_node", "D_matched_node"]),
+        "duration_s": _first_existing(cols, ["actual_duration_s", "OD_Time_s"]),
+        "od_dist_km": _first_existing(cols, ["OD_Dist_km", "distance_km", "actual_distance_km"]),
+    }
+    required = ["pickup_time", "dropoff_time", "pickup_lat", "pickup_lng", "dropoff_lat", "dropoff_lng"]
+    if any(mapping[item] is None for item in required):
+        return pd.DataFrame()
+    work = pd.DataFrame({key: od_df[value] if value is not None else np.nan for key, value in mapping.items()})
+    work["pickup_time"] = pd.to_datetime(work["pickup_time"], errors="coerce")
+    work["dropoff_time"] = pd.to_datetime(work["dropoff_time"], errors="coerce")
+    for col in ["pickup_lat", "pickup_lng", "dropoff_lat", "dropoff_lng", "pickup_node", "dropoff_node", "duration_s", "od_dist_km"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    missing_duration = work["duration_s"].isna()
+    work.loc[missing_duration, "duration_s"] = (work.loc[missing_duration, "dropoff_time"] - work.loc[missing_duration, "pickup_time"]).dt.total_seconds()
+    missing_dist = work["od_dist_km"].isna()
+    work.loc[missing_dist, "od_dist_km"] = work.loc[missing_dist].apply(
+        lambda row: haversine_distance(row["pickup_lat"], row["pickup_lng"], row["dropoff_lat"], row["dropoff_lng"]),
+        axis=1,
+    )
+    work = work.dropna(subset=["pickup_time", "dropoff_time", "pickup_lat", "pickup_lng", "dropoff_lat", "dropoff_lng", "duration_s"])
+    work = work[(work["duration_s"] > 60) & (work["duration_s"] <= 4 * 3600)].copy()
+    work = work[work["od_dist_km"].fillna(0).between(0, 200, inclusive="both")].reset_index(drop=True)
+    return work
+
+
+def _grid_code(lat, lng, precision=100):
+    if pd.isna(lat) or pd.isna(lng):
+        return "na"
+    return f"{int(float(lat) * precision)}_{int(float(lng) * precision)}"
+
+
+def _stable_region_id(value, modulo=10000):
+    text = str(value or "na")
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % int(modulo)
+
+
+def _route_features_for_nodes(graph, pickup_node, dropoff_node):
+    result = {"network_distance_km": np.nan, "shortest_route_km": np.nan, "fastest_route_cost_min": np.nan}
+    if graph is None or nx is None or pd.isna(pickup_node) or pd.isna(dropoff_node):
+        return result
+    try:
+        origin = int(pickup_node)
+        dest = int(dropoff_node)
+        shortest_nodes = nx.shortest_path(graph, origin, dest, weight="length")
+        shortest = _route_summary(graph, shortest_nodes, weight="length")
+        result["network_distance_km"] = float(shortest.get("distance_m", 0.0)) / 1000.0
+        result["shortest_route_km"] = result["network_distance_km"]
+        try:
+            fastest_nodes = nx.shortest_path(graph, origin, dest, weight="route_cost")
+            fastest = _route_summary(graph, fastest_nodes, weight="route_cost")
+            result["fastest_route_cost_min"] = float(fastest.get("route_cost_s", 0.0)) / 60.0
+        except Exception:
+            result["fastest_route_cost_min"] = np.nan
+    except Exception:
+        pass
+    return result
+
+
+def _eta_feature_frame(orders, graph=None, region_speed_lookup=None, route_sample_limit=300):
+    work = orders.copy().reset_index(drop=True)
+    work["hour"] = work["pickup_time"].dt.hour.astype(float)
+    work["weekday"] = work["pickup_time"].dt.dayofweek.astype(float)
+    work["is_morning_peak"] = work["hour"].between(7, 9, inclusive="both").astype(float)
+    work["is_evening_peak"] = work["hour"].between(17, 19, inclusive="both").astype(float)
+    work["is_peak"] = ((work["is_morning_peak"] > 0) | (work["is_evening_peak"] > 0)).astype(float)
+    work["straight_distance_km"] = work.apply(
+        lambda row: haversine_distance(row["pickup_lat"], row["pickup_lng"], row["dropoff_lat"], row["dropoff_lng"]),
+        axis=1,
+    )
+    work["origin_grid"] = work.apply(lambda row: _grid_code(row["pickup_lat"], row["pickup_lng"]), axis=1)
+    work["dest_grid"] = work.apply(lambda row: _grid_code(row["dropoff_lat"], row["dropoff_lng"]), axis=1)
+    work["region_key"] = work["origin_grid"] + "|" + work["dest_grid"]
+    work["pickup_region_id"] = work["origin_grid"].map(_stable_region_id).astype(float)
+    work["dropoff_region_id"] = work["dest_grid"].map(_stable_region_id).astype(float)
+    work["region_pair_id"] = work["region_key"].map(_stable_region_id).astype(float)
+    work["order_distance_km"] = pd.to_numeric(work["od_dist_km"], errors="coerce")
+    work["straight_to_order_distance_ratio"] = work["straight_distance_km"] / work["order_distance_km"].replace(0, np.nan)
+    work["straight_to_order_distance_ratio"] = work["straight_to_order_distance_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    work["observed_speed_kmh"] = work["od_dist_km"] / (work["duration_s"] / 3600.0).replace(0, np.nan)
+    if region_speed_lookup is None:
+        region_speed_lookup = work.groupby("region_key")["observed_speed_kmh"].mean().dropna().to_dict()
+    global_speed = float(work["observed_speed_kmh"].replace([np.inf, -np.inf], np.nan).dropna().median()) if len(work) else CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    if not np.isfinite(global_speed) or global_speed <= 0:
+        global_speed = CONFIG["DEFAULT_ETA_SPEED_KMH"]
+    work["historical_region_speed"] = work["region_key"].map(region_speed_lookup).fillna(global_speed)
+    work["pickup_grid_lat"] = np.floor(work["pickup_lat"] * 100.0)
+    work["pickup_grid_lng"] = np.floor(work["pickup_lng"] * 100.0)
+    work["dropoff_grid_lat"] = np.floor(work["dropoff_lat"] * 100.0)
+    work["dropoff_grid_lng"] = np.floor(work["dropoff_lng"] * 100.0)
+    work["network_distance_km"] = np.nan
+    work["shortest_route_km"] = np.nan
+    work["fastest_route_cost_min"] = np.nan
+    if graph is not None:
+        limit = min(int(route_sample_limit or 0), len(work))
+        for idx in range(limit):
+            route_feat = _route_features_for_nodes(graph, work.at[idx, "pickup_node"], work.at[idx, "dropoff_node"])
+            for key, value in route_feat.items():
+                work.at[idx, key] = value
+    work["network_distance_km"] = work["network_distance_km"].fillna(work["straight_distance_km"] * 1.35)
+    work["shortest_route_km"] = work["shortest_route_km"].fillna(work["network_distance_km"])
+    work["fastest_route_cost_min"] = work["fastest_route_cost_min"].fillna(work["network_distance_km"] / work["historical_region_speed"].clip(lower=5) * 60.0)
+    return work, region_speed_lookup, global_speed
+
+
+ETA_MODEL_FEATURES = [
+    "hour",
+    "weekday",
+    "is_morning_peak",
+    "is_evening_peak",
+    "is_peak",
+    "pickup_lat",
+    "pickup_lng",
+    "dropoff_lat",
+    "dropoff_lng",
+    "pickup_grid_lat",
+    "pickup_grid_lng",
+    "dropoff_grid_lat",
+    "dropoff_grid_lng",
+    "pickup_region_id",
+    "dropoff_region_id",
+    "region_pair_id",
+    "straight_distance_km",
+    "order_distance_km",
+    "straight_to_order_distance_ratio",
+    "network_distance_km",
+    "shortest_route_km",
+    "fastest_route_cost_min",
+    "historical_region_speed",
+]
+
+ETA_MODEL_FEATURE_LABELS = {
+    "hour": "小时",
+    "weekday": "星期",
+    "is_morning_peak": "早高峰",
+    "is_evening_peak": "晚高峰",
+    "is_peak": "是否高峰",
+    "pickup_lat": "起点纬度",
+    "pickup_lng": "起点经度",
+    "dropoff_lat": "终点纬度",
+    "dropoff_lng": "终点经度",
+    "pickup_grid_lat": "起点网格纬向",
+    "pickup_grid_lng": "起点网格经向",
+    "dropoff_grid_lat": "终点网格纬向",
+    "dropoff_grid_lng": "终点网格经向",
+    "pickup_region_id": "起点区域编码",
+    "dropoff_region_id": "终点区域编码",
+    "region_pair_id": "OD区域对编码",
+    "straight_distance_km": "直线距离(km)",
+    "order_distance_km": "订单载客公里数(km)",
+    "straight_to_order_distance_ratio": "直线/订单距离比",
+    "network_distance_km": "路网距离(km)",
+    "shortest_route_km": "最短路线长度(km)",
+    "fastest_route_cost_min": "最快路线成本(min)",
+    "historical_region_speed": "同区域历史均速(km/h)",
+}
+
+
+def train_eta_duration_model(max_orders=800, route_sample_limit=250, random_seed=42):
+    od_df, od_meta = _read_eta_od_cache()
+    orders = _normalize_eta_orders(od_df)
+    if len(orders) < 30:
+        return {"success": False, "error": "可用于训练的 OD 订单不足。", "od_meta": od_meta, "rows": int(len(orders))}
+    max_orders = max(50, int(max_orders or 800))
+    orders = orders.sort_values("pickup_time").reset_index(drop=True)
+    if len(orders) > max_orders:
+        orders = orders.sample(n=max_orders, random_state=int(random_seed)).sort_values("pickup_time").reset_index(drop=True)
+    graph, network_meta = load_road_network()
+    baseline_stats, baseline_meta = _read_edge_baseline_speed_cache()
+    if graph is not None and baseline_meta.get("success"):
+        apply_baseline_route_cost(graph, baseline_stats, baseline_meta.get("highway_median_speed", {}), default_speed_kph=CONFIG["DEFAULT_HIGHWAY_SPEED_KPH"])
+    feature_df, region_speed_lookup, global_speed = _eta_feature_frame(orders, graph=graph, route_sample_limit=route_sample_limit)
+    model_df = feature_df.dropna(subset=ETA_MODEL_FEATURES + ["duration_s"]).replace([np.inf, -np.inf], np.nan).dropna(subset=ETA_MODEL_FEATURES + ["duration_s"])
+    if len(model_df) < 30:
+        return {"success": False, "error": "特征生成后可训练样本不足。", "rows": int(len(model_df))}
+    rng = np.random.default_rng(int(random_seed))
+    indices = np.arange(len(model_df))
+    rng.shuffle(indices)
+    split = max(1, int(len(indices) * 0.8))
+    train_idx = indices[:split]
+    test_idx = indices[split:] if split < len(indices) else indices[:max(1, min(20, len(indices)))]
+    X = model_df[ETA_MODEL_FEATURES].to_numpy(dtype=float)
+    y_minutes = (model_df["duration_s"].to_numpy(dtype=float) / 60.0)
+    y = np.log1p(np.maximum(y_minutes, 0.0))
+    x_mean = X[train_idx].mean(axis=0)
+    x_std = X[train_idx].std(axis=0)
+    x_std[x_std == 0] = 1.0
+    X_train = (X[train_idx] - x_mean) / x_std
+    X_test = (X[test_idx] - x_mean) / x_std
+    X_train_aug = np.column_stack([np.ones(len(X_train)), X_train])
+    ridge = 1.0
+    penalty = np.eye(X_train_aug.shape[1]) * ridge
+    penalty[0, 0] = 0.0
+    coef = np.linalg.pinv(X_train_aug.T @ X_train_aug + penalty) @ X_train_aug.T @ y[train_idx]
+    pred_log = np.column_stack([np.ones(len(X_test)), X_test]) @ coef
+    pred = np.expm1(pred_log)
+    actual = y_minutes[test_idx]
+    err = pred - actual
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mape = float(np.mean(np.abs(err) / np.maximum(actual, 1.0)) * 100.0)
+    ss_res = float(np.sum(err ** 2))
+    ss_tot = float(np.sum((actual - actual.mean()) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    samples = []
+    sample_df = model_df.iloc[test_idx].copy().head(10)
+    for row_idx, (_, row) in enumerate(sample_df.iterrows()):
+        samples.append(
+            {
+                "车辆ID": str(row.get("vehicle_id", "")),
+                "上车时间": pd.Timestamp(row["pickup_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "真实耗时(分钟)": round(float(row["duration_s"]) / 60.0, 2),
+                "预测耗时(分钟)": round(float(pred[row_idx]), 2) if row_idx < len(pred) else None,
+                "误差(分钟)": round(float(pred[row_idx] - row["duration_s"] / 60.0), 2) if row_idx < len(pred) else None,
+            }
+        )
+    return {
+        "success": True,
+        "model_type": "Ridge线性回归(log耗时)",
+        "feature_names": ETA_MODEL_FEATURES,
+        "feature_labels": ETA_MODEL_FEATURE_LABELS,
+        "coef": coef.tolist(),
+        "x_mean": x_mean.tolist(),
+        "x_std": x_std.tolist(),
+        "region_speed_lookup": {str(k): float(v) for k, v in region_speed_lookup.items() if pd.notna(v)},
+        "global_region_speed": float(global_speed),
+        "metrics": {"MAE(分钟)": mae, "RMSE(分钟)": rmse, "MAPE(%)": mape, "R2": r2},
+        "sample_errors": samples,
+        "rows": int(len(model_df)),
+        "train_rows": int(len(train_idx)),
+        "test_rows": int(len(test_idx)),
+        "od_meta": od_meta,
+        "network": network_meta,
+        "route_sample_limit": int(route_sample_limit),
+    }
+
+
+def _predict_with_eta_model(model, feature_row):
+    X = np.array([[float(feature_row.get(name, 0.0)) for name in model["feature_names"]]], dtype=float)
+    mean = np.array(model["x_mean"], dtype=float)
+    std = np.array(model["x_std"], dtype=float)
+    coef = np.array(model["coef"], dtype=float)
+    Xs = (X - mean) / std
+    pred_log = float(np.column_stack([np.ones(1), Xs]) @ coef)
+    return float(max(0.0, np.expm1(pred_log)))
+
+
+def estimate_eta_model(origin_lat, origin_lng, dest_lat, dest_lng, departure_time=None, vehicle_ids=None, start_time=None, end_time=None, bucket_minutes=15, max_train_orders=800):
+    rule_eta = estimate_eta(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids=vehicle_ids, start_time=start_time, end_time=end_time, bucket_minutes=bucket_minutes)
+    model = train_eta_duration_model(max_orders=max_train_orders, route_sample_limit=min(250, max_train_orders))
+    if not model.get("success"):
+        return {"success": False, "error": model.get("error", "模型训练失败。"), "rule_eta": rule_eta, "model": model}
+    graph, _network_meta = load_road_network()
+    dt = pd.Timestamp(departure_time or start_time or datetime.now())
+    pickup_node = rule_eta.get("origin_node") if rule_eta else np.nan
+    dropoff_node = rule_eta.get("dest_node") if rule_eta else np.nan
+    one = pd.DataFrame([
+        {
+            "vehicle_id": "query",
+            "pickup_time": dt,
+            "dropoff_time": dt + pd.Timedelta(minutes=1),
+            "pickup_lat": float(origin_lat),
+            "pickup_lng": float(origin_lng),
+            "dropoff_lat": float(dest_lat),
+            "dropoff_lng": float(dest_lng),
+            "pickup_node": pickup_node,
+            "dropoff_node": dropoff_node,
+            "duration_s": 60.0,
+            "od_dist_km": haversine_distance(origin_lat, origin_lng, dest_lat, dest_lng),
+        }
+    ])
+    features, _, _ = _eta_feature_frame(
+        one,
+        graph=graph,
+        region_speed_lookup=model.get("region_speed_lookup", {}),
+        route_sample_limit=1,
+    )
+    if "historical_region_speed" in features.columns:
+        features["historical_region_speed"] = features["historical_region_speed"].fillna(float(model.get("global_region_speed", CONFIG["DEFAULT_ETA_SPEED_KMH"])))
+    feature_row = features.iloc[0].to_dict()
+    raw_predicted_minutes = _predict_with_eta_model(model, feature_row)
+    distance_km = float(rule_eta.get("distance_km", feature_row.get("network_distance_km", 0.0))) if rule_eta else float(feature_row.get("network_distance_km", 0.0))
+    min_minutes = max(1.0, distance_km / CONFIG["ANIMATION_SPEED_CAP_KMH"] * 60.0)
+    max_minutes = max(min_minutes, distance_km / 5.0 * 60.0)
+    predicted_minutes = float(np.clip(raw_predicted_minutes, min_minutes, max_minutes))
+    return {
+        "success": True,
+        "eta_minutes": float(predicted_minutes),
+        "raw_eta_minutes": float(raw_predicted_minutes),
+        "distance_km": distance_km,
+        "avg_speed_kmh": float(distance_km / (predicted_minutes / 60.0)) if predicted_minutes > 0 else 0.0,
+        "route_points": rule_eta.get("route_points", []) if rule_eta else [],
+        "route_segments": rule_eta.get("route_segments", []) if rule_eta else [],
+        "alternatives": rule_eta.get("alternatives", []) if rule_eta else [],
+        "rule_eta_minutes": rule_eta.get("eta_minutes") if rule_eta else np.nan,
+        "model_metrics": model.get("metrics", {}),
+        "sample_errors": model.get("sample_errors", []),
+        "feature_values": {name: float(feature_row.get(name, 0.0)) for name in ETA_MODEL_FEATURES},
+        "feature_names": ETA_MODEL_FEATURES,
+        "feature_labels": ETA_MODEL_FEATURE_LABELS,
+        "model_rows": model.get("rows", 0),
+        "train_rows": model.get("train_rows", 0),
+        "test_rows": model.get("test_rows", 0),
+        "method": "模型版ETA：OD订单监督学习，Ridge回归使用时间、空间、距离、路网与区域历史速度特征预测订单耗时。",
+        "model": model,
+        "rule_eta": rule_eta,
+    }
 
 def plot_eta_route(eta_result, save_path=None):
     if not eta_result or not eta_result.get("success"):
@@ -4157,7 +5067,7 @@ def plot_eta_route(eta_result, save_path=None):
             )
         )
     )
-    add_map_layers(m)
+    add_map_layers(m, include_boundary=True, include_picker=False)
     output_path = save_path or os.path.join(CONFIG["OUTPUT_MAP_DIR"], "eta_route.html")
     ensure_parent_dir(output_path)
     m.save(output_path)

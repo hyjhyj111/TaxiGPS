@@ -12,6 +12,7 @@
 """
 
 from datetime import datetime, time
+import json
 import logging
 import os
 import sys
@@ -39,6 +40,7 @@ from map_plotter import (  # noqa: E402
     load_od_data,
     load_vehicle_trajectory,
     estimate_eta,
+    estimate_eta_model,
     plot_animated_trajectory,
     plot_congestion_roads,
     plot_eta_route,
@@ -47,6 +49,7 @@ from map_plotter import (  # noqa: E402
     plot_od_points,
     plot_road_corrected_trajectories,
     plot_vehicle_trajectories,
+    run_hmm_speed_aggregation,
     plot_vehicle_trajectory,
     road_network_status,
 )
@@ -149,6 +152,13 @@ DEFAULTS = {
     "last_active_view": "轨迹查询",
     "road_correction_enabled": False,
     "congestion_bucket_minutes": 15,
+    "eta_mode": "规则版",
+    "eta_model_train_orders": 800,
+    "hmm_aggregation_max_vehicles": 8,
+    "hmm_aggregation_min_samples": 3,
+    "hmm_aggregation_force_rebuild": False,
+    "congestion_use_full_day": True,
+    "congestion_rebuild_requested": False,
     "eta_origin_lat": float(CONFIG["MAP_CENTER"][0]),
     "eta_origin_lng": float(CONFIG["MAP_CENTER"][1]),
     "eta_dest_lat": 22.6008,
@@ -157,7 +167,9 @@ DEFAULTS = {
     "route_origin_lng": float(CONFIG["MAP_CENTER"][1]),
     "route_dest_lat": 22.6008,
     "route_dest_lng": 114.1010,
-    "route_source_mode": "手动坐标",
+    "route_source_mode": "地图选点",
+    "route_map_reset_requested": False,
+    "route_map_calculate_requested": False,
     "route_od_index": 0,
     "history_od_candidate_options": [],
     "history_od_candidate_selected": [],
@@ -413,6 +425,34 @@ def cached_eta_result(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids, s
     )
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_eta_model_result(origin_lat, origin_lng, dest_lat, dest_lng, vehicle_ids, start_time, end_time, bucket_minutes, max_train_orders):
+    return estimate_eta_model(
+        origin_lat,
+        origin_lng,
+        dest_lat,
+        dest_lng,
+        departure_time=start_time,
+        vehicle_ids=tuple(vehicle_ids or []),
+        start_time=start_time,
+        end_time=end_time,
+        bucket_minutes=bucket_minutes,
+        max_train_orders=int(max_train_orders),
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_hmm_speed_aggregation(vehicle_ids, start_time, end_time, bucket_minutes, min_samples, force_rebuild):
+    return run_hmm_speed_aggregation(
+        tuple(vehicle_ids or []),
+        start_time=start_time,
+        end_time=end_time,
+        bucket_minutes=int(bucket_minutes),
+        min_samples=int(min_samples),
+        force_rebuild=bool(force_rebuild),
+    )
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def cached_export_bundle(query_date, order_stats, operation_stats, cluster_result=None):
     return export_statistics_bundle(query_date, order_stats, operation_stats, cluster_result=cluster_result)
@@ -643,7 +683,6 @@ def render_history_od_sidebar_tools():
             for item in selected[:10]
             if normalize_vehicle_id(item)
         ]
-        st.session_state["route_source_mode"] = "历史OD端点"
         st.session_state["route_points"] = []
         st.session_state["route_result"] = None
         st.session_state["last_query"] = build_query_payload()
@@ -712,7 +751,46 @@ def render_sidebar():
         )
 
         if active_view == "路线规划":
-            render_history_od_sidebar_tools()
+            st.markdown("---")
+            st.markdown("**路线规划**")
+            if st.session_state.get("route_source_mode") not in {"地图选点", "历史OD端点"}:
+                st.session_state["route_source_mode"] = "地图选点"
+            route_mode = st.radio(
+                "起终点来源",
+                ["地图选点", "历史OD端点"],
+                key="route_source_mode",
+            )
+            if route_mode == "地图选点":
+                route_cols = st.columns(2)
+                with route_cols[0]:
+                    if st.button("重新选点", key="route_sidebar_reset_points", use_container_width=True):
+                        st.session_state["route_map_reset_requested"] = True
+                        st.rerun()
+                with route_cols[1]:
+                    can_calculate_route = len(st.session_state.get("route_points", [])) == 2
+                    if st.button(
+                        "计算路线",
+                        key="route_sidebar_calculate",
+                        use_container_width=True,
+                        type="primary" if can_calculate_route else "secondary",
+                        disabled=not can_calculate_route,
+                    ):
+                        st.session_state["route_map_calculate_requested"] = True
+                        st.rerun()
+            else:
+                render_history_od_sidebar_tools()
+
+        if active_view == "拥堵与ETA":
+            st.markdown("---")
+            st.markdown("**拥堵与ETA**")
+            st.selectbox(
+                "聚合时间片",
+                options=[5, 15, 30, 60],
+                index=[5, 15, 30, 60].index(int(st.session_state.get("congestion_bucket_minutes", 15))),
+                key="congestion_bucket_minutes",
+                format_func=lambda value: f"{value} 分钟",
+            )
+            st.checkbox("道路拥堵使用当天全日", key="congestion_use_full_day")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -722,6 +800,35 @@ def render_sidebar():
 
         st.text_input("分钟查询", key="minute_time_of_day", placeholder="09:30", label_visibility="collapsed")
 
+        if active_view == "热力图与统计分析":
+            selected_heatmap_panel = st.session_state.get("heatmap_analysis_panel", "静态热力图")
+            if selected_heatmap_panel == "静态热力图":
+                st.markdown("---")
+                st.markdown("**静态热力图**")
+                st.selectbox(
+                    "数据来源",
+                    options=["minute", "pickup"],
+                    key="heatmap_source",
+                    format_func=_source_label,
+                )
+                st.checkbox("采用聚类热力图", key="heatmap_enable_cluster")
+            elif selected_heatmap_panel == "动态热力图":
+                st.markdown("---")
+                st.markdown("**动态热力图**")
+                st.selectbox(
+                    "数据来源",
+                    options=["minute", "pickup"],
+                    key="dynamic_source",
+                    format_func=_source_label,
+                )
+                st.selectbox(
+                    "时间粒度",
+                    options=[1, 15, 30, 60],
+                    key="dynamic_granularity",
+                    format_func=lambda value: f"{value} 分钟",
+                )
+                if st.button("生成动态热力图", key="sidebar_dynamic_heatmap_submit", use_container_width=True, type="primary"):
+                    st.session_state["dynamic_heatmap_sidebar_submitted"] = True
 
         query_cols = st.columns(2)
         with query_cols[0]:
@@ -1100,66 +1207,26 @@ def _resolve_heatmap_vehicle_scope(source_type, selected_vehicle_ids):
 
 
 def render_static_heatmap_tab(payload):
-    st.markdown("#### 静态热力图")
     selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
+    selected_source_type = st.session_state.get("heatmap_source", "pickup")
+    enable_cluster = bool(st.session_state.get("heatmap_enable_cluster", False))
+    request_vehicle_ids = _resolve_heatmap_vehicle_scope(selected_source_type, selected_vehicle_ids)
 
-    with st.form("static_heatmap_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            selected_source_type = st.selectbox(
-                "数据来源",
-                options=["minute", "pickup"],
-                key="heatmap_source",
-                format_func=_source_label,
-                help="分钟缓存表示车辆位置累计分布，OD 上车点表示乘客上车需求累计分布。",
-            )
-        with c2:
-            enable_cluster = st.checkbox("启用聚类热力图", key="heatmap_enable_cluster")
-        with c3:
-            threshold_quantile = st.slider("热度阈值分位数", 0.50, 0.99, key="heatmap_threshold_quantile", step=0.01, help="用于裁剪过高权重，避免全图过热。")
-
-        c6, c7 = st.columns(2)
-        with c6:
-            eps_km = st.number_input("聚类半径 eps(km)", min_value=0.05, max_value=2.0, step=0.05, key="heatmap_eps_km", format="%.2f")
-        with c7:
-            min_samples = st.number_input("最小样本数 min_samples", min_value=2, max_value=50, step=1, key="heatmap_min_samples")
-        st.caption("聚类参数仅在启用聚类时生效。聚类后热力值定义为簇内空间聚合点权重之和。")
-        submitted = st.form_submit_button("生成静态热力图", use_container_width=True, type="primary")
-
-    if submitted or st.session_state["static_heatmap_request"] is None:
-        request_vehicle_ids = _resolve_heatmap_vehicle_scope(selected_source_type, selected_vehicle_ids)
-        st.session_state["static_heatmap_request"] = {
-            "source_type": selected_source_type,
-            "enable_cluster": bool(enable_cluster),
-            "eps_km": float(eps_km),
-            "min_samples": int(min_samples),
-            "threshold_quantile": float(threshold_quantile),
-            "start_time": payload["start_time"],
-            "end_time": payload["end_time"],
-            "vehicle_ids": request_vehicle_ids,
-        }
-
-    request = st.session_state["static_heatmap_request"]
-    if request and request["source_type"] == "minute" and request.get("vehicle_ids"):
-        request = {**request, "vehicle_ids": ()}
+    request = {
+        "source_type": selected_source_type,
+        "enable_cluster": enable_cluster,
+        "eps_km": float(st.session_state.get("heatmap_eps_km", DEFAULTS["heatmap_eps_km"])),
+        "min_samples": int(st.session_state.get("heatmap_min_samples", DEFAULTS["heatmap_min_samples"])),
+        "threshold_quantile": float(st.session_state.get("heatmap_threshold_quantile", DEFAULTS["heatmap_threshold_quantile"])),
+        "start_time": payload["start_time"],
+        "end_time": payload["end_time"],
+        "vehicle_ids": request_vehicle_ids,
+    }
+    if st.session_state.get("static_heatmap_request") != request:
         st.session_state["static_heatmap_request"] = request
-    st.caption("参数调整不会立即重算，点击“生成静态热力图”后才会执行。")
-    rec, _ = cached_source_recommendation(
-        request["source_type"],
-        request["start_time"],
-        request["end_time"],
-        request["vehicle_ids"] or None,
-    )
-    st.caption(
-        f"当前执行来源 {_source_label(request['source_type'])}；推荐 DBSCAN 参数 eps≈{rec['eps_km']} km, min_samples≈{rec['min_samples']}。"
-    )
-    if request["source_type"] == "minute":
-        st.caption("分钟缓存车辆位置热力图固定按全部车辆统计，不受左侧车辆ID筛选影响。")
-    else:
-        st.caption("OD 上车点热力图会按当前车辆ID筛选结果执行。")
 
     with st.spinner("正在生成静态热力图..."):
-        html_path, info = cached_static_heatmap(
+        html_path, _info = cached_static_heatmap(
             source_type=request["source_type"],
             start_time=request["start_time"],
             end_time=request["end_time"],
@@ -1174,80 +1241,38 @@ def render_static_heatmap_tab(payload):
         st.warning("当前条件下没有可用于静态热力图的数据。")
         return
 
-    cols = st.columns(5)
-    metrics = [
-        ("原始点数", info.get("input_points", 0)),
-        ("聚合热力点", info.get("heat_points", 0)),
-        ("渲染点数", info.get("render_heat_points", info.get("heat_points", 0))),
-        ("聚类簇数", info.get("cluster_count", 0) if request["enable_cluster"] else "未启用"),
-        ("阈值上限", f"{info.get('threshold_cap', 0.0):.2f}"),
-    ]
-    for col, (label, value) in zip(cols, metrics):
-        with col:
-            st.metric(label, value)
-
-    filter_stats = info.get("filter_stats", {})
-    st.caption(
-        f"来源标识: {info.get('source_label', '--')}；边界过滤 {filter_stats.get('bounds_removed', 0)} 点，"
-        f"漂移过滤 {filter_stats.get('drift_removed', 0)} 点，"
-        f"渲染策略 {info.get('render_reduction_method', 'none')} / 上限 {info.get('render_point_limit', '--')}，"
-        f"输出地图 {info.get('output_path', '--')}。"
-    )
-    render_html_map(html_path, height=760)
+    render_html_map(html_path, height=820)
 
 
 def render_dynamic_heatmap_tab(payload):
-    st.markdown("#### 动态热力图")
     selected_vehicle_ids = _normalize_vehicle_scope(payload.get("trajectory_vehicle_ids", []))
-
-    with st.form("dynamic_heatmap_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.selectbox("数据来源", ["minute", "pickup"], key="dynamic_source", format_func=_source_label)
-        with c2:
-            st.selectbox("时间粒度", [1, 15, 30, 60], key="dynamic_granularity", format_func=lambda x: f"{x} 分钟")
-        with c3:
-            st.selectbox("平滑算法", ["EMA", "WMA"], key="dynamic_smoothing")
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            st.slider("热度阈值分位数", 0.50, 0.99, key="dynamic_threshold_quantile", step=0.01)
-        with c5:
-            st.slider("EMA alpha", 0.10, 0.95, key="dynamic_ema_alpha", step=0.05)
-        with c6:
-            st.slider("WMA 窗口", 2, 8, key="dynamic_wma_window")
-        st.caption("动态热力图时间片结构为 `[{time, points:[[lat, lon, weight], ...]}]`，分钟级请求过密时会自动提升到 15/30/60 分钟聚合。")
-        submitted = st.form_submit_button("生成动态热力图", use_container_width=True, type="primary")
+    submitted = bool(st.session_state.get("dynamic_heatmap_sidebar_submitted", False))
+    st.session_state["dynamic_heatmap_sidebar_submitted"] = False
 
     if submitted:
-        dynamic_source_type = st.session_state["dynamic_source"]
+        dynamic_source_type = st.session_state.get("dynamic_source", "pickup")
         request_vehicle_ids = _resolve_heatmap_vehicle_scope(dynamic_source_type, selected_vehicle_ids)
         st.session_state["dynamic_heatmap_request"] = {
             "source_type": dynamic_source_type,
-            "requested_granularity": int(st.session_state["dynamic_granularity"]),
+            "requested_granularity": int(st.session_state.get("dynamic_granularity", DEFAULTS["dynamic_granularity"])),
             "vehicle_ids": request_vehicle_ids,
-            "smoothing_method": st.session_state["dynamic_smoothing"],
-            "ema_alpha": float(st.session_state["dynamic_ema_alpha"]),
-            "wma_window": int(st.session_state["dynamic_wma_window"]),
-            "threshold_quantile": float(st.session_state["dynamic_threshold_quantile"]),
+            "smoothing_method": st.session_state.get("dynamic_smoothing", DEFAULTS["dynamic_smoothing"]),
+            "ema_alpha": float(st.session_state.get("dynamic_ema_alpha", DEFAULTS["dynamic_ema_alpha"])),
+            "wma_window": int(st.session_state.get("dynamic_wma_window", DEFAULTS["dynamic_wma_window"])),
+            "threshold_quantile": float(st.session_state.get("dynamic_threshold_quantile", DEFAULTS["dynamic_threshold_quantile"])),
             "start_time": payload["start_time"],
             "end_time": payload["end_time"],
         }
 
-    request = st.session_state["dynamic_heatmap_request"]
+    request = st.session_state.get("dynamic_heatmap_request")
     if request and request["source_type"] == "minute" and request.get("vehicle_ids"):
         request = {**request, "vehicle_ids": ()}
         st.session_state["dynamic_heatmap_request"] = request
     if request is None:
-        st.info("当前仅显示动态热力图配置。点击“生成动态热力图”后才会开始加载和渲染。")
         return
-    st.caption("参数调整不会立即重算，点击“生成动态热力图”后才会执行。")
-    if request["source_type"] == "minute":
-        st.caption("分钟缓存车辆位置动态热力图固定按全部车辆统计，不受左侧车辆ID筛选影响。")
-    else:
-        st.caption("OD 上车点动态热力图会按当前车辆ID筛选结果执行。")
+
     with st.spinner("正在生成动态热力图..."):
-        html_path, info = cached_dynamic_heatmap(
+        html_path, _info = cached_dynamic_heatmap(
             source_type=request["source_type"],
             start_time=request["start_time"],
             end_time=request["end_time"],
@@ -1263,33 +1288,7 @@ def render_dynamic_heatmap_tab(payload):
         st.warning("当前条件下没有可用于动态热力图的数据。")
         return
 
-    granularity = info.get("granularity", {})
-    animation_profile = info.get("animation_profile", {})
-    cols = st.columns(4)
-    metrics = [
-        ("请求粒度", f"{granularity.get('requested_minutes', '--')} 分钟"),
-        ("实际粒度", f"{granularity.get('actual_minutes', '--')} 分钟"),
-        ("时间片数", granularity.get("estimated_slices", 0)),
-        ("动画配置", f"{animation_profile.get('target_fps', 60)}fps / {animation_profile.get('transition_ms', '--')}ms"),
-    ]
-    for col, (label, value) in zip(cols, metrics):
-        with col:
-            st.metric(label, value)
-
-    if granularity.get("auto_adjusted"):
-        st.info(
-            f"为避免一次加载过多时间片，系统已将动态热力图从 {granularity.get('requested_minutes')} 分钟自动调整为 "
-            f"{granularity.get('actual_minutes')} 分钟聚合。"
-        )
-
-    time_slices = info.get("time_slices", [])
-    preview_slice = time_slices[0]["points"][:3] if time_slices else []
-    st.caption(
-        f"来源标识: {info.get('source_label', '--')}；平滑算法 {info.get('smoothing_method', '--')}；时间片数 {len(time_slices)}；首片样例 {preview_slice if preview_slice else '[]'}；"
-        f"导出地图 {info.get('output_path', '--')}。"
-    )
-    render_html_map(html_path, height=760)
-
+    render_html_map(html_path, height=820)
 
 def render_order_statistics_tab(payload):
     st.markdown("#### 订单统计分析")
@@ -1506,15 +1505,335 @@ def render_heatmap_stats_view(payload):
         render_pickup_cluster_tab(payload)
 
 
-def render_congestion_eta_view(payload):
-    st.subheader("拥堵道路与 ETA")
-    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
-    if not trajectory_vehicle_ids:
-        st.info(f"请选择 1-{CONFIG['MAX_CONGESTION_VEHICLES']} 辆车作为 HMM 匹配和历史速度样本。")
+def _eta_route_result_for_component(eta_result):
+    if not eta_result or not eta_result.get("success"):
+        return None
+    alternatives = eta_result.get("alternatives") or []
+    shortest = alternatives[0] if alternatives else {}
+    fastest = alternatives[1] if len(alternatives) > 1 else shortest
+    return {
+        "success": True,
+        "shortest": {
+            "points": shortest.get("route_points", eta_result.get("route_points", [])),
+            "distance_m": float(shortest.get("distance_km", eta_result.get("distance_km", 0.0))) * 1000.0,
+            "route_cost_s": float(shortest.get("eta_minutes", eta_result.get("eta_minutes", 0.0))) * 60.0,
+            "edge_count": int(shortest.get("edge_count", len(shortest.get("route_segments", [])))),
+        },
+        "fastest": {
+            "points": fastest.get("route_points", eta_result.get("route_points", [])),
+            "distance_m": float(fastest.get("distance_km", eta_result.get("distance_km", 0.0))) * 1000.0,
+            "route_cost_s": float(fastest.get("eta_minutes", eta_result.get("eta_minutes", 0.0))) * 60.0,
+            "edge_count": int(fastest.get("edge_count", len(fastest.get("route_segments", [])))),
+        },
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _load_shenzhen_boundary_geojson():
+    for path in CONFIG.get("BOUNDARY_PATHS", []):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                logger.exception("深圳边界文件读取失败: %s", path)
+                return None
+    return None
+
+
+def _render_eta_map_picker(eta_result=None):
+    import importlib
+    import route_planner
+
+    render_route_component_map = importlib.reload(route_planner).render_route_component_map
+
+    st.session_state.setdefault("eta_route_points", [])
+    click_payload = render_route_component_map(
+        st.session_state["eta_route_points"],
+        _eta_route_result_for_component(eta_result),
+        key=f"eta_route_map_{len(st.session_state['eta_route_points'])}_{bool(eta_result and eta_result.get('success'))}",
+        height=620,
+        boundary_geojson=_load_shenzhen_boundary_geojson(),
+    )
+    if isinstance(click_payload, dict) and "lat" in click_payload and "lng" in click_payload:
+        clicked_lat = float(click_payload["lat"])
+        clicked_lng = float(click_payload["lng"])
+        current_click = str(click_payload.get("nonce") or f"{clicked_lat}_{clicked_lng}")
+        if st.session_state.get("last_eta_route_click") != current_click:
+            st.session_state["last_eta_route_click"] = current_click
+            if len(st.session_state["eta_route_points"]) >= 2:
+                st.session_state["eta_route_points"] = []
+            st.session_state["eta_route_points"].append({"lat": clicked_lat, "lng": clicked_lng})
+            if len(st.session_state["eta_route_points"]) >= 1:
+                st.session_state["eta_origin_lat"] = st.session_state["eta_route_points"][0]["lat"]
+                st.session_state["eta_origin_lng"] = st.session_state["eta_route_points"][0]["lng"]
+            if len(st.session_state["eta_route_points"]) >= 2:
+                st.session_state["eta_dest_lat"] = st.session_state["eta_route_points"][1]["lat"]
+                st.session_state["eta_dest_lng"] = st.session_state["eta_route_points"][1]["lng"]
+            st.rerun()
+
+
+def _render_eta_explanation(eta_result):
+    alternatives = eta_result.get("alternatives") or []
+    if alternatives:
+        rows = []
+        for item in alternatives:
+            rows.append(
+                {
+                    "路线方案": item.get("label"),
+                    "距离(km)": round(float(item.get("distance_km", 0.0)), 3),
+                    "ETA(分钟)": round(float(item.get("eta_minutes", 0.0)), 2),
+                    "估算均速(km/h)": round(float(item.get("avg_speed_kmh", 0.0)), 2),
+                    "道路边数": item.get("edge_count", 0),
+                    "缺失速度边": item.get("missing_speed_edges", 0),
+                    "路径模式": item.get("path_mode", ""),
+                }
+            )
+        st.markdown("#### 路线方案对比")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    speed_sources = eta_result.get("speed_sources") or {}
+    if speed_sources:
+        source_df = pd.DataFrame(
+            [{"速度来源": key, "路段数": value} for key, value in speed_sources.items()]
+        ).sort_values("路段数", ascending=False)
+        chart = (
+            alt.Chart(source_df)
+            .mark_bar(color="#2563eb")
+            .encode(
+                x=alt.X("路段数:Q", title="路段数"),
+                y=alt.Y("速度来源:N", sort="-x", title="速度来源"),
+                tooltip=["速度来源", "路段数"],
+            )
+        )
+        st.markdown("#### ETA速度来源")
+        st.altair_chart(chart, use_container_width=True)
+
+    slow_segments = eta_result.get("slow_segments") or []
+    if slow_segments:
+        slow_df = pd.DataFrame(slow_segments)[["segment_key", "length_km", "speed_kmh", "eta_minutes", "speed_source"]].copy()
+        slow_df = slow_df.rename(
+            columns={
+                "segment_key": "道路边",
+                "length_km": "长度(km)",
+                "speed_kmh": "速度(km/h)",
+                "eta_minutes": "耗时(分钟)",
+                "speed_source": "速度来源",
+            }
+        )
+        st.markdown("#### 主要慢速路段")
+        st.dataframe(slow_df.round(3), use_container_width=True, hide_index=True)
+
+
+
+def _congestion_time_window(payload):
+    if st.session_state.get("congestion_use_full_day", True):
+        day = payload["start_time"].date()
+        return datetime.combine(day, time(0, 0)), datetime.combine(day, time(23, 59, 59))
+    return payload["start_time"], payload["end_time"]
+
+
+def _congestion_vehicle_scope(selected_vehicle_ids):
+    available_vehicle_ids = get_available_vehicle_ids()
+    cleaned = [str(item).strip() for item in selected_vehicle_ids or [] if str(item).strip()]
+    if cleaned:
+        return cleaned[: int(st.session_state.get("hmm_aggregation_max_vehicles", 8))]
+    return available_vehicle_ids[: int(st.session_state.get("hmm_aggregation_max_vehicles", 8))]
+
+
+def render_congestion_roads_tab(payload, selected_vehicle_ids):
+    bucket_minutes = int(st.session_state.get("congestion_bucket_minutes", 15))
+    congestion_start, congestion_end = _congestion_time_window(payload)
+    aggregation_vehicle_ids = _congestion_vehicle_scope(selected_vehicle_ids)
+
+    with st.expander("道路速度缓存", expanded=False):
+        cols = st.columns(3)
+        with cols[0]:
+            st.number_input("车辆上限", min_value=1, max_value=50, step=1, key="hmm_aggregation_max_vehicles")
+        with cols[1]:
+            st.number_input("最小样本数", min_value=1, max_value=20, step=1, key="hmm_aggregation_min_samples")
+        with cols[2]:
+            st.checkbox("强制重建", key="hmm_aggregation_force_rebuild")
+        if st.button("生成/更新拥堵速度缓存", key="congestion_rebuild_speed_cache", use_container_width=True, type="primary"):
+            st.session_state["congestion_rebuild_requested"] = True
+
+    if st.session_state.pop("congestion_rebuild_requested", False):
+        if not aggregation_vehicle_ids:
+            st.warning("没有可用于聚合的车辆缓存。")
+        else:
+            with st.spinner("正在执行HMM路网校正并聚合道路速度..."):
+                result = cached_hmm_speed_aggregation(
+                    aggregation_vehicle_ids,
+                    congestion_start,
+                    congestion_end,
+                    bucket_minutes,
+                    int(st.session_state.get("hmm_aggregation_min_samples", 3)),
+                    bool(st.session_state.get("hmm_aggregation_force_rebuild", False)),
+                )
+            if result.get("success"):
+                st.success(
+                    f"速度缓存已更新：可靠道路边 {result.get('reliable_edges', 0)} 条，"
+                    f"时间片记录 {result.get('time_slice_rows', 0)} 条。"
+                )
+                st.cache_data.clear()
+            else:
+                st.error(result.get("error", "拥堵速度缓存生成失败。"))
+
+    with st.spinner("正在读取道路速度缓存并生成拥堵地图..."):
+        congestion_html, congestion_meta = cached_congestion_roads(
+            selected_vehicle_ids,
+            congestion_start,
+            congestion_end,
+            bucket_minutes,
+        )
+
+    if not congestion_meta or not congestion_meta.get("success"):
+        st.error((congestion_meta or {}).get("error", "拥堵道路生成失败。"))
         return
 
-    if len(trajectory_vehicle_ids) > CONFIG["MAX_CONGESTION_VEHICLES"]:
-        st.warning(f"为保持响应速度，拥堵道路示例仅使用前 {CONFIG['MAX_CONGESTION_VEHICLES']} 辆车；可缩短时间窗口来观察更细的拥堵变化。")
+    render_html_map(congestion_html, height=800)
+
+def render_eta_prediction_tab(payload, selected_vehicle_ids):
+    bucket_minutes = int(st.session_state.get("congestion_bucket_minutes", 15))
+    mode_cols = st.columns([1, 1])
+    with mode_cols[0]:
+        input_mode = st.radio("ETA输入方式", ["地图选点", "文本坐标"], horizontal=True, label_visibility="collapsed")
+    with mode_cols[1]:
+        eta_mode = st.radio("ETA模型", ["规则版", "模型版"], key="eta_mode", horizontal=True, label_visibility="collapsed")
+
+    eta_result = None
+    if eta_mode == "模型版":
+        st.number_input("训练订单上限", min_value=100, max_value=3000, step=100, key="eta_model_train_orders")
+
+    if input_mode == "文本坐标":
+        eta_cols = st.columns(4)
+        with eta_cols[0]:
+            origin_lat = st.number_input("起点纬度", format="%.6f", key="eta_origin_lat")
+        with eta_cols[1]:
+            origin_lng = st.number_input("起点经度", format="%.6f", key="eta_origin_lng")
+        with eta_cols[2]:
+            dest_lat = st.number_input("终点纬度", format="%.6f", key="eta_dest_lat")
+        with eta_cols[3]:
+            dest_lng = st.number_input("终点经度", format="%.6f", key="eta_dest_lng")
+    else:
+        if st.button("重新选点", use_container_width=True):
+            st.session_state["eta_route_points"] = []
+            st.rerun()
+        origin_lat = float(st.session_state.get("eta_origin_lat", CONFIG["MAP_CENTER"][0]))
+        origin_lng = float(st.session_state.get("eta_origin_lng", CONFIG["MAP_CENTER"][1]))
+        dest_lat = float(st.session_state.get("eta_dest_lat", 22.6008))
+        dest_lng = float(st.session_state.get("eta_dest_lng", 114.1010))
+
+    can_estimate = input_mode == "文本坐标" or len(st.session_state.get("eta_route_points", [])) >= 2
+    if can_estimate:
+        if eta_mode == "模型版":
+            with st.spinner("正在训练OD耗时回归模型并预测ETA..."):
+                eta_result = cached_eta_model_result(
+                    origin_lat,
+                    origin_lng,
+                    dest_lat,
+                    dest_lng,
+                    selected_vehicle_ids,
+                    payload["start_time"],
+                    payload["end_time"],
+                    bucket_minutes,
+                    int(st.session_state.get("eta_model_train_orders", 800)),
+                )
+        else:
+            with st.spinner("正在按路网边速度缓存估算ETA..."):
+                eta_result = cached_eta_result(
+                    origin_lat,
+                    origin_lng,
+                    dest_lat,
+                    dest_lng,
+                    selected_vehicle_ids,
+                    payload["start_time"],
+                    payload["end_time"],
+                    bucket_minutes,
+                )
+
+    if input_mode == "地图选点":
+        _render_eta_map_picker(eta_result)
+        if not can_estimate:
+            st.info("请在地图上依次点击起点和终点。")
+            return
+
+    if not eta_result or not eta_result.get("success"):
+        st.error((eta_result or {}).get("error", "ETA 估算失败。"))
+        return
+
+    eta_metric_cols = st.columns(5)
+    eta_metric_cols[0].metric("预测耗时", f"{eta_result['eta_minutes']:.1f} 分钟")
+    eta_metric_cols[1].metric("路网距离", f"{eta_result.get('distance_km', 0):.2f} km")
+    eta_metric_cols[2].metric("估算均速", f"{eta_result.get('avg_speed_kmh', 0):.1f} km/h")
+    if eta_mode == "模型版":
+        eta_metric_cols[3].metric("原始模型输出", f"{eta_result.get('raw_eta_minutes', eta_result['eta_minutes']):.1f} 分钟")
+        eta_metric_cols[4].metric("训练/测试", f"{eta_result.get('train_rows', 0)} / {eta_result.get('test_rows', 0)}")
+    else:
+        eta_metric_cols[3].metric("速度回退边", eta_result.get("missing_speed_edges", 0))
+        eta_metric_cols[4].metric("路径模式", eta_result.get("path_mode", "--"))
+    st.caption(eta_result.get("method", ""))
+
+    if input_mode == "文本坐标":
+        eta_path = plot_eta_route(eta_result)
+        render_html_map(eta_path, height=620)
+
+    if eta_mode == "模型版":
+        metrics = eta_result.get("model_metrics", {})
+        if metrics:
+            metric_df = pd.DataFrame([{"指标": key, "值": round(float(value), 4)} for key, value in metrics.items()])
+            st.markdown("#### 模型指标")
+            st.dataframe(metric_df, use_container_width=True, hide_index=True)
+        sample_errors = eta_result.get("sample_errors") or []
+        if sample_errors:
+            st.markdown("#### 样例误差")
+            st.dataframe(pd.DataFrame(sample_errors), use_container_width=True, hide_index=True)
+        feature_values = eta_result.get("feature_values") or {}
+        if feature_values:
+            feature_labels = eta_result.get("feature_labels") or {}
+            feature_df = pd.DataFrame(
+                [
+                    {"特征": feature_labels.get(key, key), "字段": key, "当前值": round(float(value), 4)}
+                    for key, value in feature_values.items()
+                ]
+            )
+            with st.expander("查看当前预测特征", expanded=False):
+                st.dataframe(feature_df, use_container_width=True, hide_index=True)
+    else:
+        _render_eta_explanation(eta_result)
+
+
+def render_cache_validation_tab(payload, selected_vehicle_ids):
+    status = road_network_status()
+    od_df, od_meta = load_completed_od_cache()
+    speed_path = CONFIG.get("BASELINE_SPEED_CACHE_PATH", "cache/edge_baseline_speed.csv")
+    road_cache_dir = CONFIG["ROAD_CORRECTED_CACHE_DIR"]
+    road_files = []
+    if os.path.isdir(road_cache_dir):
+        road_files = [name for name in os.listdir(road_cache_dir) if name.lower().endswith(".csv")]
+    speed_exists = os.path.exists(speed_path)
+    rows = [
+        {"缓存项": "路网文件", "状态": "可用" if status.get("available") else "缺失", "路径/说明": status.get("path") or status.get("error", "")},
+        {"缓存项": "校正OD缓存", "状态": "可用" if od_meta.get("success") else "缺失", "路径/说明": od_meta.get("cache_path") or od_meta.get("error", "")},
+        {"缓存项": "路网校正轨迹缓存", "状态": "可用" if road_files else "缺失", "路径/说明": f"{road_cache_dir} | 文件 {len(road_files)} 个"},
+        {"缓存项": "道路速度缓存", "状态": "可用" if speed_exists else "缺失", "路径/说明": speed_path},
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("拥堵与ETA页面只读取以上缓存；不会扫描原始GPS大表，也不会在查询时重新执行路网校正。")
+
+    selected = selected_vehicle_ids or []
+    if selected:
+        details = []
+        for vehicle_id in selected[: CONFIG["MAX_CONGESTION_VEHICLES"]]:
+            matches = [name for name in road_files if name.startswith(f"{vehicle_id}_")]
+            details.append({"车辆ID": vehicle_id, "路网校正缓存": "有" if matches else "无", "文件数": len(matches)})
+        st.markdown("#### 已选车辆缓存覆盖")
+        st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
+
+
+def render_congestion_eta_view(payload):
+    st.subheader("拥堵与ETA")
+    trajectory_vehicle_ids = payload.get("trajectory_vehicle_ids", [])
     selected_vehicle_ids = trajectory_vehicle_ids[: CONFIG["MAX_CONGESTION_VEHICLES"]]
 
     status = road_network_status()
@@ -1524,76 +1843,13 @@ def render_congestion_eta_view(payload):
         st.warning("未找到路网文件。请将 shenzhen_drive.pkl 或 shenzhen_drive.graphml 放到项目根目录、data/ 或 cache/，或设置 TAXIGPS_ROAD_NETWORK_PATH。")
         return
 
-    control_cols = st.columns([1, 1, 2])
-    with control_cols[0]:
-        bucket_minutes = st.selectbox(
-            "聚合时间片",
-            options=[5, 15, 30, 60],
-            index=[5, 15, 30, 60].index(int(st.session_state.get("congestion_bucket_minutes", 15))),
-            key="congestion_bucket_minutes",
-            help="按固定时间片统计每个匹配路段平均速度。",
-        )
-    with control_cols[1]:
-        st.metric("样本车辆", len(selected_vehicle_ids))
-    with control_cols[2]:
-        st.caption("近似 HMM 使用最近道路节点作为发射近似，并用最短路连续性约束相邻 GPS 点转移；路段 key 使用道路节点对。")
-
-    with st.spinner("正在执行近似 HMM 地图匹配并聚合路段速度..."):
-        congestion_html, congestion_meta = cached_congestion_roads(
-            selected_vehicle_ids,
-            payload["start_time"],
-            payload["end_time"],
-            bucket_minutes,
-        )
-
-    if not congestion_meta or not congestion_meta.get("success"):
-        st.error((congestion_meta or {}).get("error", "拥堵道路生成失败。"))
-    else:
-        metric_cols = st.columns(4)
-        metric_cols[0].metric("时间片", congestion_meta.get("time_slices", 0))
-        metric_cols[1].metric("路段记录", congestion_meta.get("segment_rows", 0))
-        metric_cols[2].metric("聚合粒度", f"{congestion_meta.get('bucket_minutes', bucket_minutes)} 分钟")
-        metric_cols[3].metric("匹配方法", "近似 HMM")
-        if congestion_meta.get("matching"):
-            st.dataframe(pd.DataFrame(congestion_meta["matching"]), use_container_width=True, hide_index=True)
-        render_html_map(congestion_html, height=760)
-
-    st.markdown("#### ETA 预测")
-    eta_cols = st.columns(4)
-    with eta_cols[0]:
-        origin_lat = st.number_input("起点纬度", format="%.6f", key="eta_origin_lat")
-    with eta_cols[1]:
-        origin_lng = st.number_input("起点经度", format="%.6f", key="eta_origin_lng")
-    with eta_cols[2]:
-        dest_lat = st.number_input("终点纬度", format="%.6f", key="eta_dest_lat")
-    with eta_cols[3]:
-        dest_lng = st.number_input("终点经度", format="%.6f", key="eta_dest_lng")
-
-    with st.spinner("正在按路网距离和历史平均速度估算 ETA..."):
-        eta_result = cached_eta_result(
-            origin_lat,
-            origin_lng,
-            dest_lat,
-            dest_lng,
-            selected_vehicle_ids,
-            payload["start_time"],
-            payload["end_time"],
-            bucket_minutes,
-        )
-
-    if not eta_result.get("success"):
-        st.error(eta_result.get("error", "ETA 估算失败。"))
-        return
-
-    eta_metric_cols = st.columns(4)
-    eta_metric_cols[0].metric("预计耗时", f"{eta_result['eta_minutes']:.1f} 分钟")
-    eta_metric_cols[1].metric("路网距离", f"{eta_result['distance_km']:.2f} km")
-    eta_metric_cols[2].metric("估算均速", f"{eta_result['avg_speed_kmh']:.1f} km/h")
-    eta_metric_cols[3].metric("历史均速", f"{eta_result['historical_speed_kmh']:.1f} km/h")
-    st.caption(eta_result.get("method", ""))
-
-    eta_path = plot_eta_route(eta_result)
-    render_html_map(eta_path, height=620)
+    tabs = st.tabs(["道路拥堵", "ETA预测", "缓存校验"])
+    with tabs[0]:
+        render_congestion_roads_tab(payload, selected_vehicle_ids)
+    with tabs[1]:
+        render_eta_prediction_tab(payload, selected_vehicle_ids)
+    with tabs[2]:
+        render_cache_validation_tab(payload, selected_vehicle_ids)
 
 
 
